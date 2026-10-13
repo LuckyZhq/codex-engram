@@ -206,11 +206,16 @@ v0.7.13 fixes the every-turn failure on DSH 0.1.7 (native session format v4) ([#
 ## Development
 
 ```sh
-pnpm install            # postinstall symlinks @deepseek-ai/* peers from ../deepseek-harness (run pnpm install && pnpm run build in the harness repo first)
+pnpm install            # prepare symlinks @deepseek-ai/* peers from ../deepseek-harness (run pnpm install && pnpm run build in the harness repo first); runs pnpm bundle automatically when lib/ is missing
 pnpm test               # unit + composition tests; real-embedding e2e runs when ENGRAM_E2E=1 (HF_ENDPOINT configurable) and the network allows
 pnpm typecheck
 pnpm bundle
 ```
+
+Two notes on install and build scripts:
+
+- **GitHub source quick-install** (`dsh plugin add github:kenz1117/dsh-engram`) fetches sources; `prepare` runs `pnpm bundle` on the spot when `lib/` is missing. If that build fails, read the bundle section of the prepare log — not the host's misleading "no entry point".
+- **Native build permission**: the native packages pulled in transitively by `@huggingface/transformers` (`onnxruntime-node`, `sharp`, `protobufjs`) need pnpm's permission to run their build scripts. pnpm 11 ignores the in-package `pnpm.onlyBuiltDependencies` field; the permission must live on the **consumer** side (profile / workspace) — pnpm 11 uses `allowBuilds` in `pnpm-workspace.yaml`, pnpm 10 uses `onlyBuiltDependencies` in the same file. Without it pnpm skips those builds and reports the skips as errors, leaving the embedder unusable; grant the permission and reinstall.
 
 ## Model Experience
 

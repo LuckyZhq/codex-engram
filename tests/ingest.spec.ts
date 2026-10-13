@@ -203,6 +203,32 @@ describe('ingestPreviousTurn', () => {
     expect(outcome.written).toBe(0)
   })
 
+  it('空答案重试一次成功：第二次调用产出合法 JSON 并正常写入', async () => {
+    let calls = 0
+    const outcome = await ingestPreviousTurn(baseDeps({
+      call: async () => { calls += 1; return calls === 1 ? '' : VALID_LLM_OUTPUT },
+    }))
+    expect(calls).toBe(2)
+    expect(outcome.written).toBe(2)
+    expect(outcome.skipped).toBeNull()
+  })
+
+  it('空答案重试后仍为空：skipped 记 empty-answer', async () => {
+    let calls = 0
+    const outcome = await ingestPreviousTurn(baseDeps({ call: async () => { calls += 1; return '' } }))
+    expect(calls).toBe(2)
+    expect(outcome.skipped).toBe('empty-answer')
+    expect(outcome.written).toBe(0)
+  })
+
+  it('非空不可解析不重试：前缀抢救失败直接记 unparseable-output', async () => {
+    let calls = 0
+    const outcome = await ingestPreviousTurn(baseDeps({ call: async () => { calls += 1; return '这不是 JSON' } }))
+    expect(calls).toBe(1)
+    expect(outcome.skipped).toBe('unparseable-output')
+    expect(outcome.written).toBe(0)
+  })
+
   it('路由覆盖优先于日志解析', async () => {
     const logged: IngestRequestEventData[] = []
     await ingestPreviousTurn(baseDeps({

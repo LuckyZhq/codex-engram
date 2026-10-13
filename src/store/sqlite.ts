@@ -13,6 +13,8 @@ import { EngramError, EPISODE_PROXIMITY_MS_DEFAULT, EPISODE_TIMELINE_LIMIT_DEFAU
 import { assignSlot } from '../palace/slots.ts'
 import { nextSchedule } from '../review/sm2.ts'
 import { scorePlacard } from '../imagery/score.ts'
+// 余弦相似度：store 检索与巩固聚类共享 src/vec.ts 的单一实现（维度不匹配告警一次）。
+import { cosine } from '../vec.ts'
 import type {
   DecayOptions, EngramEdgeType, EngramScope, EntityDetail, EntityId, EntityListFilter,
   EntityListResult, EntityMention, EntityRecord, ExportData, FactListFilter, FactListResult,
@@ -299,21 +301,6 @@ function observationRowToRecord(row: ObservationRow): ObservationRecord {
     updatedAt: row.updated_at,
     lastValidatedAt: row.last_validated_at,
   }
-}
-
-/** 余弦相似度；任一向量零范数时返回 0。 */
-function cosine(a: Float32Array, b: Float32Array): number {
-  let dot = 0
-  let na = 0
-  let nb = 0
-  const len = Math.min(a.length, b.length)
-  for (let i = 0; i < len; i++) {
-    dot += a[i]! * b[i]!
-    na += a[i]! * a[i]!
-    nb += b[i]! * b[i]!
-  }
-  if (na === 0 || nb === 0) return 0
-  return dot / (Math.sqrt(na) * Math.sqrt(nb))
 }
 
 /**

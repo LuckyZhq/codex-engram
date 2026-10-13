@@ -12,6 +12,8 @@
 import type { EngramEmbedder } from '../embedder/interface.ts'
 import type { EngramStore } from '../store/interface.ts'
 import type { MemoryRecord } from '../types.ts'
+// 余弦相似度：与 store 检索共享 src/vec.ts 的单一实现（维度不匹配告警一次）。
+import { cosine } from '../vec.ts'
 
 /** 单条整理动作（写入 op_log 的统一标记）。 */
 const CONSOLIDATION_OP = 'consolidation'
@@ -175,19 +177,4 @@ export async function runConsolidation(
     /* 审计失败不影响整理结果 */
   }
   return report
-}
-
-/** cosine 相似度（两个等长非零向量）。 */
-function cosine(a: Float32Array, b: Float32Array): number {
-  let dot = 0
-  let na = 0
-  let nb = 0
-  const n = Math.min(a.length, b.length)
-  for (let i = 0; i < n; i += 1) {
-    dot += a[i]! * b[i]!
-    na += a[i]! * a[i]!
-    nb += b[i]! * b[i]!
-  }
-  const denom = Math.sqrt(na) * Math.sqrt(nb)
-  return denom === 0 ? 0 : dot / denom
 }

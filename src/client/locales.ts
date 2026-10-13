@@ -236,6 +236,7 @@ export type EngramKey =
   | 'skipNoTurn'
   | 'skipNoRoute'
   | 'skipUnparsable'
+  | 'skipEmptyAnswer'
   | 'opProfileEdit'
   | 'profileOpCreate'
   | 'profileOpEdit'
@@ -569,6 +570,7 @@ export const zh: Record<EngramKey, string> = {
   skipNoTurn: '无此轮',
   skipNoRoute: '日志无路由',
   skipUnparsable: '提炼输出不可解析',
+  skipEmptyAnswer: '提炼输出为空（重试后仍空）',
   opProfileEdit: '画像修订',
   profileOpCreate: '创建 v{to} · {chars} 字',
   profileOpEdit: '编辑 v{from}→v{to} · {chars} 字',
@@ -894,6 +896,7 @@ export const en: Record<EngramKey, string> = {
   skipNoTurn: 'no such turn',
   skipNoRoute: 'no route in log',
   skipUnparsable: 'unparsable output',
+  skipEmptyAnswer: 'empty output (empty after retry)',
   opProfileEdit: 'profile revised',
   profileOpCreate: 'created v{to} · {chars} chars',
   profileOpEdit: 'edited v{from}→v{to} · {chars} chars',

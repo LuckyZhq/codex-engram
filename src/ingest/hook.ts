@@ -29,8 +29,9 @@ const MODE_LIMITS: Readonly<Record<Exclude<IngestMode, 'off'>, { maxCandidates: 
   eager: { maxCandidates: 5, confidence: 0.4, includeAssistant: true },
 }
 
-/** 摄取输出 token 上限（提取 JSON 数组，短输出足够）。 */
-const INGEST_MAX_TOKENS = 600
+/** 摄取输出 token 上限。completion 预算含 reasoning_tokens：推理模型可能把预算耗在思考上、
+    答案为空（实测 600/2000 都会出现，4000 未复现），上限给足余量而非按答案长度估。 */
+const INGEST_MAX_TOKENS = 4000
 
 /** op_log 幂等键 op：该 (sessionId, turn) 已完成摄取。 */
 export const INGEST_DONE_OP = 'ingest-done'
@@ -59,6 +60,7 @@ const INGEST_SYSTEM = [
   'entities 是这条记忆里提到的具体对象（人名/项目名/工具名/概念名），没有就省略该字段；实体名要短（专名本身，不超过 20 字），aliases 列出该实体的其他叫法，没有就省略。',
   'facts 列出这条记忆中关于具体实体的客观事实（状态/归属/关系/数据），entity 必须取该条 entities 里出现过的实体名，一条一个知识点，没有就省略该字段。',
   'scope 决定这条记忆进哪座宫殿：只跟当前项目/仓库有关的（技术选型、项目约定、架构决策、该项目自身的事实）用 project；与具体项目无关、跨项目通用的（个人偏好、习惯、用户本人的经历、通用事实）用 user。拿不准用 project。',
+  '忠实转述：原文中被否定、拒绝或纠正的内容，记录时必须保持其被否定的语义，不得写成正面断言；不要添加原文没有的关联、判断或结论。',
   '只提取明确、可复用的信息；寒暄、临时上下文、你自己的回答不要提取。没有值得记的就输出 []。',
   '不要输出 JSON 以外的任何内容。',
 ].join('\n')
@@ -443,7 +445,7 @@ export async function ingestPreviousTurn(deps: IngestDeps): Promise<IngestOutcom
     : ''
   const userText = `从下面这轮对话（JSON 数组）提取值得长期记住的信息：\n${JSON.stringify(cleaned)}${recallNote === '' ? '' : `\n${recallNote}`}`
   deps.logRequest({ route, round, userText, maxTokens: INGEST_MAX_TOKENS, mode: deps.mode })
-  const raw = await deps.call({
+  let raw = await deps.call({
     route,
     system: INGEST_SYSTEM,
     userText,
@@ -451,8 +453,25 @@ export async function ingestPreviousTurn(deps: IngestDeps): Promise<IngestOutcom
     purpose: 'engram-ingest',
     signal: deps.signal,
   })
-  const parsed = parseJsonArray(raw)
-  if (parsed === undefined) return { scannedEvents: slice.length, candidates: 0, written: 0, merged: 0, deferred: 0, dropped: 0, skipped: 'unparseable-output' }
+  let parsed = parseJsonArray(raw)
+  // 空答案重试一次：推理模型的 reasoning_tokens 计入 completion 预算，预算可能耗在思考上
+  // （答案为空），一整轮对话因此静默丢失。重试给该轮第二次机会；非空但不可解析的输出
+  // 已有 parseJsonArray 前缀抢救，不重试（避免为坏输出双倍计费）。
+  if (parsed === undefined && raw.trim() === '') {
+    raw = await deps.call({
+      route,
+      system: INGEST_SYSTEM,
+      userText,
+      maxTokens: INGEST_MAX_TOKENS,
+      purpose: 'engram-ingest',
+      signal: deps.signal,
+    })
+    parsed = parseJsonArray(raw)
+  }
+  if (parsed === undefined) {
+    // 失败原因细分：空答案（重试后仍空）与不可解析分开记，事后排查不必回放请求。
+    return { scannedEvents: slice.length, candidates: 0, written: 0, merged: 0, deferred: 0, dropped: 0, skipped: raw.trim() === '' ? 'empty-answer' : 'unparseable-output' }
+  }
 
   const embedder = await deps.embedder
   const writtenContents: string[] = []

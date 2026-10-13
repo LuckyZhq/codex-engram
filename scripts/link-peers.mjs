@@ -59,4 +59,5 @@ for (const [name, rel] of LINKED_PACKAGES) {
   symlinkSync(target, link, 'dir')
   created += 1
 }
-console.log(`[link-peers] ok（新建 ${created} 个链接，跳过 ${skipped} 个无源码环境的 peer，共 ${LINKED_PACKAGES.length} 个）`)
+// 英文输出：这份摘要最常被贴进 issue/安装日志（贡献者含英文用户），中文注释留在源码内。
+console.log(`[link-peers] ok: created ${created}, skipped ${skipped} of ${LINKED_PACKAGES.length} peers${skipped === LINKED_PACKAGES.length ? ' (all already provided by the host profile — nothing to link, this is expected)' : ''}`)

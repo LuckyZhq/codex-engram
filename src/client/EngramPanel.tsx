@@ -1882,7 +1882,10 @@ const SKIP_KEY: Record<string, EngramKey> = {
   'no-such-turn': 'skipNoTurn',
   'no-previous-turn': 'skipNoTurn',
   'no-route-in-log': 'skipNoRoute',
-  unparsable: 'skipUnparsable',
+  // hook 产出的原因值（hook.ts）：不可解析 'unparseable-output'、空答案 'empty-answer'。
+  // 旧键 'unparsable' 从未与产出对上过，导致该原因一直以原始英文展示（#11）。
+  'unparseable-output': 'skipUnparsable',
+  'empty-answer': 'skipEmptyAnswer',
 }
 
 /** 跳过原因的本地化标签（未知枚举回退原值）。 */

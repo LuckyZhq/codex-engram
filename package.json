@@ -1,7 +1,7 @@
 {
   "name": "@kenz1117/dsh-engram",
   "description": "Cross-session long-term memory for DeepSeek Harness (memory palace · AGI Architecture Exploration on dsh-market): dual-scope SQLite memory graph, hybrid retrieval, provenance audit, and a knowledge flywheel.",
-  "version": "0.7.15",
+  "version": "0.7.16",
   "icon": "icon.svg",
   "logo": "icon-256.svg",
   "publishConfig": {
@@ -45,7 +45,7 @@
     }
   },
   "scripts": {
-    "prepare": "node scripts/link-peers.mjs",
+    "prepare": "node scripts/link-peers.mjs && node scripts/ensure-build.mjs",
     "bundle": "tsdown",
     "watch": "tsdown --watch",
     "test": "vitest run",
@@ -91,12 +91,5 @@
     "tsdown": "^0.22.14",
     "typescript": "^5.9.3",
     "vitest": "^4.1.11"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "onnxruntime-node",
-      "sharp",
-      "protobufjs"
-    ]
   }
 }

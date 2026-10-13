@@ -207,11 +207,16 @@ v0.7.13 修复 DSH 0.1.7（原生会话格式 v4）下的每回合失败（[#5](
 ## 开发
 
 ```sh
-pnpm install            # postinstall 会把 @deepseek-ai/* peer 从 ../deepseek-harness symlink 进来（需先在 harness 仓库 pnpm install && pnpm run build）
+pnpm install            # prepare 会把 @deepseek-ai/* peer 从 ../deepseek-harness symlink 进来（需先在 harness 仓库 pnpm install && pnpm run build）；lib/ 缺失时自动执行 pnpm bundle
 pnpm test               # 单测 + 组合测试；真实嵌入 e2e：ENGRAM_E2E=1（可配 HF_ENDPOINT）且网络可达时执行
 pnpm typecheck
 pnpm bundle
 ```
+
+安装与构建脚本的两点说明：
+
+- **GitHub 源码快捷安装**（`dsh plugin add github:kenz1117/dsh-engram`）拿的是源码，`prepare` 会在 `lib/` 缺失时自动执行 `pnpm bundle` 现场构建——失败时看 prepare 日志的 bundle 段，而不是宿主报的 "no entry point"。
+- **原生依赖构建许可**：`@huggingface/transformers` 传递的原生包（`onnxruntime-node`、`sharp`、`protobufjs`）需要 pnpm 允许运行构建脚本。pnpm 11 已忽略包内 `pnpm.onlyBuiltDependencies` 声明，许可必须写在**使用方**（profile / workspace）侧——pnpm 11 用 `pnpm-workspace.yaml` 的 `allowBuilds`，pnpm 10 用同文件的 `onlyBuiltDependencies`。未许可时 pnpm 会跳过这些构建并把跳过列为错误，嵌入功能不可用；许可后重装即可。
 
 ## Model Experience
 
