@@ -3,3 +3,17 @@ lib/
 *.log
 *.tsbuildinfo
 .DS_Store
+
+# codex/ui 构建产物与验收截图（verify-render.mjs 可随时重新生成）
+codex/ui/dist/
+codex/ui/.verify/
+
+# codex 侧构建产物（与 lib/ 同策：pnpm bundle:codex 生成，不入库）
+codex/dist/
+
+# 本机工具产物（不进库）
+.playwright-cli/
+.codegraph/
+# .codex/hooks.json 含本机绝对路径且与宿主信任哈希绑定；可移植模板见
+# codex/hooks/hooks.example.json（复制到 .codex/ 后需 /hooks 信任）
+.codex/

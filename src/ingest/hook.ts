@@ -15,6 +15,7 @@ import type { EngramStore } from '../store/interface.ts'
 import type { EngramEntityKind, EngramKind, EngramScope, EntityMention, FactMention, FactWriteInput, MemoryId } from '../types.ts'
 import { normalizeEntityName } from '../types.ts'
 import { sanitizeProtocolText } from '../security/sanitize.ts'
+import { INGEST_DONE_OP, INGEST_PENDING_OP, decodeTurnKey, encodeTurnKey } from './keys.ts'
 import { redactSecrets } from '../security/redact.ts'
 import { hasRecallToolCalls, omitRecallToolResults } from '../security/recall.ts'
 import { applyMerge, confirmContradictions, decideWrite } from '../write-disposition.ts'
@@ -33,26 +34,9 @@ const MODE_LIMITS: Readonly<Record<Exclude<IngestMode, 'off'>, { maxCandidates: 
     答案为空（实测 600/2000 都会出现，4000 未复现），上限给足余量而非按答案长度估。 */
 const INGEST_MAX_TOKENS = 4000
 
-/** op_log 幂等键 op：该 (sessionId, turn) 已完成摄取。 */
-export const INGEST_DONE_OP = 'ingest-done'
-/** op_log pending 键 op：disposed 末轮摄取失败/超时，待下次会话重放补做。 */
-export const INGEST_PENDING_OP = 'ingest-pending'
-/** disposed 末轮摄取的超时（fire-and-forget 观察器，进程退出可能打断，必须限时）。 */
-export const FINAL_INGEST_TIMEOUT_MS = 5000
-
-/** 幂等键编码：`${sessionId}#${turn}`。 */
-export function encodeTurnKey(sessionId: string, turn: number): string {
-  return `${sessionId}#${turn}`
-}
-
-/** 幂等键解码；损坏的键返回 undefined（调用方直接出队）。 */
-export function decodeTurnKey(detail: string): { sessionId: string; turn: number } | undefined {
-  const sep = detail.lastIndexOf('#')
-  if (sep <= 0) return undefined
-  const turn = Number(detail.slice(sep + 1))
-  if (!Number.isInteger(turn) || turn < 0) return undefined
-  return { sessionId: detail.slice(0, sep), turn }
-}
+// 幂等键与 op 命名在零依赖的 ./keys.ts 中定义：Codex 侧（禁止引入宿主 LLM 客户端）
+// 需要复用同一套 op 语义，故此处只做再导出，保持本模块原有的公开 API 不变。
+export { FINAL_INGEST_TIMEOUT_MS, INGEST_DONE_OP, INGEST_PENDING_OP, decodeTurnKey, encodeTurnKey } from './keys.ts'
 
 const INGEST_SYSTEM = [
   '从对话记录中提取值得跨会话长期记住的用户信息（事实/偏好/决策/经历/做事方法）。',

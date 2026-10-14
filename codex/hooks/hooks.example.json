@@ -1,0 +1,40 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node codex/hooks/runner.mjs SessionStart",
+            "timeout": 10,
+            "statusMessage": "engram: 载入长期记忆"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node codex/hooks/runner.mjs UserPromptSubmit",
+            "timeout": 10,
+            "statusMessage": "engram: 检索相关记忆"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node codex/hooks/runner.mjs Stop",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -356,20 +356,106 @@ export interface StoreAutomation {
 const DEFAULT_AUTOMATION: StoreAutomation = { autoSlot: true, reviewScheduling: true }
 
 /**
+ * 并发访问选项（可选）：多进程同时打开同一分库时（Codex 侧 MCP Server 与 Hooks 是不同进程）
+ * 需要显式配置。**缺省 undefined = 不改任何 PRAGMA**，DSH 侧行为与旧版完全一致。
+ */
+export interface StoreConcurrencyOptions {
+  /**
+   * 日志模式：'wal' 允许读写并行且写锁等待更稳（写入库头，持久生效，之后任何宿主打开该库都在 WAL 下）；
+   * 'delete' 显式回落旧模式；undefined = 不改（保持引擎默认）。
+   * 注意 WAL 需要文件系统支持共享内存（本地 NTFS 可以，部分网络盘不行）。
+   */
+  readonly journalMode?: 'wal' | 'delete'
+  /** 写锁等待毫秒数（PRAGMA busy_timeout）：避免并发写直接抛 SQLITE_BUSY；undefined = 引擎默认（0）。 */
+  readonly busyTimeoutMs?: number
+  /**
+   * 写事务起始语句：'immediate' = `BEGIN IMMEDIATE`（事务一开始就取写锁，冲突交给 busy_timeout 等待），
+   * 'deferred' / undefined = 引擎默认 `BEGIN`。
+   *
+   * 为什么需要它：延迟事务先读到快照、再升级为写时，若期间别的连接已写入，SQLite 为避免死锁
+   * **不会**调用 busy 处理器，直接返回 "database is locked"（多进程并发写实测必现）。
+   * 本包所有事务都是写事务，因此 opt-in IMMEDIATE 不会引入新的读锁竞争。
+   */
+  readonly writeTransactions?: 'deferred' | 'immediate'
+}
+
+/**
  * 打开（必要时创建）一个 scope 分库。
  * @param path - SQLite 文件路径；目录不存在会自动创建（0o700）。
  * @param rankBoost - 排序 boost 参数；缺省不乘任何因子。
  * @param automation - 写入期自动化开关（自动排桩/初始排期）；缺省全开。
+ * @param concurrency - 并发访问选项（日志模式 / 写锁等待）；缺省不改任何 PRAGMA。
  * @returns 就绪的 EngramStore。
  * @throws EngramError(code=SCHEMA_INCOMPATIBLE) 当库的 schema 版本高于当前实现。
  */
-export async function openEngramStore(path: string, rankBoost: RankBoostOptions = NO_BOOST, automation: StoreAutomation = DEFAULT_AUTOMATION): Promise<EngramStore> {
+export async function openEngramStore(
+  path: string,
+  rankBoost: RankBoostOptions = NO_BOOST,
+  automation: StoreAutomation = DEFAULT_AUTOMATION,
+  concurrency: StoreConcurrencyOptions = {},
+): Promise<EngramStore> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 })
   const { DatabaseSync } = await import('node:sqlite')
   const db = new DatabaseSync(path)
-  /** 手工事务：BEGIN/COMMIT/ROLLBACK（兼容 ^22.19 引擎范围）。 */
+  // 并发选项在建表/迁移之前生效——否则多进程同时初始化会在 schema 语句上抢锁失败。
+  /** 同步等待（open 路径是同步 API，没有异步等待点）。 */
+  const sleepSync = (ms: number): void => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+  }
+  /**
+   * PRAGMA 容错：多进程同时打开同一分库时，改日志模式可能撞上写锁（SQLITE_BUSY）。
+   * 重试几次后降级告警而不抛错——WAL 是库头持久属性，另一个进程已经设好时本次失败无影响。
+   */
+  const applyPragma = (sql: string, label: string): void => {
+    const attempts = 5
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      try {
+        db.exec(sql)
+        return
+      } catch (error) {
+        if (attempt === attempts - 1) {
+          console.warn(`[dsh-engram] ${label} 未生效（并发打开冲突，按当前模式继续）：`, error instanceof Error ? error.message : error)
+          return
+        }
+        sleepSync(30 * (attempt + 1))
+      }
+    }
+  }
+  if (concurrency.busyTimeoutMs !== undefined) {
+    const timeout = Math.max(0, Math.floor(concurrency.busyTimeoutMs))
+    applyPragma(`PRAGMA busy_timeout = ${String(timeout)}`, 'busy_timeout')
+  }
+  if (concurrency.journalMode !== undefined) {
+    applyPragma(`PRAGMA journal_mode = ${concurrency.journalMode === 'wal' ? 'WAL' : 'DELETE'}`, 'journal_mode')
+  }
+  /** 手工事务：BEGIN/COMMIT/ROLLBACK（兼容 ^22.19 引擎范围）。
+   *  并发选项要求时用 BEGIN IMMEDIATE（先取写锁，冲突走 busy_timeout 等待，见 StoreConcurrencyOptions）。 */
+  const beginStatement = concurrency.writeTransactions === 'immediate' ? 'BEGIN IMMEDIATE' : 'BEGIN'
+  /** 写锁冲突判定（SQLite 的 "database is locked" / SQLITE_BUSY）。 */
+  const isBusy = (error: unknown): boolean =>
+    /database is locked|SQLITE_BUSY/i.test(error instanceof Error ? error.message : String(error))
+  /**
+   * 开事务。IMMEDIATE 模式下对「取锁超时」做有限重试：busy_timeout 已在连接层等待，
+   * 这里再补几次短退避，机器高负载时显著降低「一次写锁超时丢掉整条写入」的概率。
+   * 只重试 BEGIN 本身（此时尚未执行任何语句，重试无副作用）；延迟 BEGIN 不重试（保持旧行为）。
+   */
+  const beginTransaction = (): void => {
+    if (beginStatement === 'BEGIN') {
+      db.exec(beginStatement)
+      return
+    }
+    for (let attempt = 0; ; attempt++) {
+      try {
+        db.exec(beginStatement)
+        return
+      } catch (error) {
+        if (attempt >= 3 || !isBusy(error)) throw error
+        sleepSync(80 * (attempt + 1))
+      }
+    }
+  }
   const withTransaction = (fn: () => void): void => {
-    db.exec('BEGIN')
+    beginTransaction()
     try {
       fn()
       db.exec('COMMIT')
