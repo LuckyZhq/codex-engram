@@ -55,9 +55,11 @@
     "backfill": "node scripts/backfill-embeddings.mjs",
     "smoke:hooks": "node codex/scripts/smoke-hooks.mjs",
     "bench:hooks": "node codex/scripts/bench-hooks.mjs",
+    "smoke:web": "node codex/scripts/smoke-web.mjs",
     "dev:ui": "vite --config codex/ui/vite.config.ts",
     "build:ui": "vite build --config codex/ui/vite.config.ts",
-    "preview:ui": "vite preview --config codex/ui/vite.config.ts"
+    "preview:ui": "vite preview --config codex/ui/vite.config.ts",
+    "start:web": "node codex/dist/web.js"
   },
   "license": "MIT",
   "keywords": [

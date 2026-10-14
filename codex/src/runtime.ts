@@ -44,6 +44,12 @@ export const CODEX_SCOPES: readonly CodexScope[] = ['user', 'project']
 /** 用户库文件名（与 DSH 同名：同一目录下两个宿主指向同一份数据）。 */
 const USER_DB_NAME = 'user.db'
 
+/**
+ * 项目分库文件名模式（与 `src/project/identity.ts` 的 `project-<sha256前24位>.db` 同构）。
+ * WebAPI 的项目发现、选择器校验、路径穿越防护共用这一个判据——不接受任何路径拼装。
+ */
+export const PROJECT_DB_NAME_PATTERN = /^project-[0-9a-f]{24}\.db$/
+
 /** 作用域目标：作用域 + 项目根（项目根的来源与校验由调用方负责）。 */
 export interface CodexScopeTarget {
   /** 目标作用域；缺省 = 由方法自定（save/list 默认 project，get/forget/restore 自动定位）。 */
@@ -160,6 +166,13 @@ export interface CodexRuntime {
   projectIdentity(projectRoot: string): ProjectIdentity
   /** 打开（必要时创建）一个分库；同一分库在实例内只打开一次。 */
   openScope(scope: CodexScope, projectRoot?: string): Promise<EngramStore>
+  /**
+   * 按已存在的分库文件名精确打开（WebAPI 项目选择器路径）：
+   * 严格校验 `project-<24位hex>.db` 且文件必须已存在，复用同一连接缓存、WAL 与事务配置。
+   * 不建空库、不接受路径拼装——与「项目路径已知走 projectRoot」互为补充，两者都不成立时
+   * 调用方必须拒绝，不得悄悄回落到其他库。
+   */
+  openExistingProjectDb(dbName: string): Promise<EngramStore>
   /** 嵌入器（lazy 模式首次调用时加载；不可用返回 undefined，检索降级为纯关键词）。 */
   ensureEmbedder(): Promise<EngramEmbedder | undefined>
   save(input: CodexSaveInput): Promise<CodexSaveResult>
@@ -287,6 +300,21 @@ export async function openCodexRuntime(config: CodexEngramConfig = {}): Promise<
     const identity = identityFor(scope, projectRoot)
     if (identity !== undefined) ensureMigrated(identity)
     return openDb(dbNameOf(scope, projectRoot))
+  }
+
+  /**
+   * 按分库文件名精确打开：只接受严格模式且已存在的项目库（UI 选择器给的就是 dbName，
+   * 不是路径）。校验失败 loud 抛错——非法名可能是路径穿越企图，缺库说明选择器已失效
+   * （工作区被删/改名），两种都不允许静默兜底。
+   */
+  const openExistingProjectDb = async (dbName: string): Promise<EngramStore> => {
+    if (!PROJECT_DB_NAME_PATTERN.test(dbName)) {
+      throw new EngramError('INVALID_PROJECT_DB', `codex-engram: 非法项目库文件名 ${dbName}（必须匹配 project-<24位hex>.db，且不是路径）`)
+    }
+    if (!existsSync(join(resolved.dbDir, dbName))) {
+      throw new EngramError('UNKNOWN_PROJECT', `codex-engram: 项目库 ${dbName} 不存在（不会自动创建空库）`)
+    }
+    return openDb(dbName)
   }
 
   /** 只读口径：库文件不存在时返回 undefined——查询不给一次性 cwd 建空库。 */
@@ -428,6 +456,7 @@ export async function openCodexRuntime(config: CodexEngramConfig = {}): Promise<
     scopeExists,
     projectIdentity: identityOf,
     openScope,
+    openExistingProjectDb,
     ensureEmbedder,
     save,
     search,

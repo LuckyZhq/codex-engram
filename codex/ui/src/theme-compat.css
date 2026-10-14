@@ -175,3 +175,79 @@ body {
     padding: 12px 12px 40px;
   }
 }
+
+/* ---------- 会话门（WebAPI 未认证时的令牌录入；紧凑风，与外框一致） ---------- */
+
+.appSessionGate {
+  min-height: 60vh;
+  display: grid;
+  place-items: center;
+}
+
+.appSessionCard {
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 24px 28px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.appSessionBrand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+
+.appSessionBrand svg {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+  color: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 70%, var(--dsw-alias-label-primary));
+}
+
+.appSessionHint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.appSessionInput {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  outline: none;
+}
+
+.appSessionInput:focus {
+  border-color: color-mix(in srgb, var(--dsw-alias-label-primary) 30%, var(--dsw-alias-border-l2));
+}
+
+.appSessionSubmit {
+  height: 30px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--dsw-alias-brand-primary);
+  color: var(--dsw-alias-label-primary-foreground);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.appSessionSubmit:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}

@@ -84,6 +84,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<boolea
   const method = req.method ?? 'GET'
 
   // ---------- GET ----------
+  if (method === 'GET' && route === 'session') {
+    // 会话探测（App.tsx 会话门）：mock 无认证层，恒已认证。
+    json(res, 200, { authenticated: true, mode: 'mock' })
+    return true
+  }
   if (method === 'GET' && route === 'workspaces') {
     json(res, 200, WORKSPACES_VIEW)
     return true

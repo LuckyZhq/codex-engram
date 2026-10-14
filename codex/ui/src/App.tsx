@@ -14,6 +14,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ReactElement } from 'react'
 import { EngramSection } from '../../../src/client/EngramPanel.tsx'
 import { buildT, detectLang } from './host.ts'
+import { SessionGate, useSessionGate } from './session.tsx'
 import {
   applyTheme, loadThemeMode, nextThemeMode, onSystemThemeChange, saveThemeMode,
   type ThemeMode,
@@ -70,6 +71,9 @@ export default function App(): ReactElement {
   // t 席位：浏览器语言决定默认词典；面板内的「中 | EN」段控可再覆盖。
   const t = useMemo(() => buildT(detectLang()), [])
 
+  // 会话门：未认证（WebAPI 401）时只显示令牌录入，认证/无认证层后才挂载面板。
+  const { state: sessionState, submitToken } = useSessionGate()
+
   return (
     <div className="appShell">
       <header className="appTopBar">
@@ -89,7 +93,9 @@ export default function App(): ReactElement {
         </button>
       </header>
       <main className="appMain">
-        <EngramSection t={t} />
+        {sessionState === 'unauthorized'
+          ? <SessionGate onSubmit={submitToken} />
+          : sessionState === 'ready' ? <EngramSection t={t} /> : null}
       </main>
     </div>
   )
