@@ -1,0 +1,177 @@
+/* ============================================================================
+ * DSH 主题 token 兼容层（Codex 独立运行时专用）
+ *
+ * 原版 src/client/panel.module.css 只「消费」--dsw-alias-* 语义令牌，不定义它们
+ * ——在 DSH 宿主里由 host 的设计平台（design-platform.css）注入。Codex 侧没有
+ * 宿主，故在此补齐两套取值，使原版 CSS 一行不改即可获得与原版一致的配色。
+ *
+ * 取值来源：deepseek-harness packages/client/ui-theme/src/styles/design-platform.css
+ * （浅色 = body 块；深色 = body[data-ds-dark-theme] 块）。
+ * 唯一例外：--dsw-alias-fill-tsp-secondary 在 harness 仓库中只有消费没有定义
+ * （由宿主运行时注入），此处按同族半透明填充取近似值。
+ *
+ * 生效方式：index.html 的内联脚本与 src/theme.ts 在 <html> 上落 data-theme
+ * （light / dark），本文件两个块分别响应。
+ * ========================================================================== */
+
+:root,
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  --dsw-alias-bg-base: #ffffff;
+  --dsw-alias-bg-layer-1: #ffffff;
+
+  --dsw-alias-label-primary: #0f1115;
+  --dsw-alias-label-secondary: #61666d;
+  --dsw-alias-label-tertiary: #81858c;
+  --dsw-alias-label-primary-foreground: #ffffff;
+
+  --dsw-alias-border-l1: rgba(0, 0, 0, 0.04);
+  --dsw-alias-border-l2: rgba(0, 0, 0, 0.1);
+
+  /* 近似值（宿主运行时注入，仓库内无定义） */
+  --dsw-alias-fill-tsp-secondary: rgba(0, 0, 0, 0.05);
+
+  /* DSH 设计平台为单色品牌：浅色下主品牌即近黑 */
+  --dsw-alias-brand-primary: #0f1115;
+
+  --dsw-alias-state-success-primary: #22c55e;
+  --dsw-alias-state-warn-primary: #f59e0b;
+  --dsw-alias-state-error-primary: #ec1313;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --dsw-alias-bg-base: #151517;
+  --dsw-alias-bg-layer-1: #232324;
+
+  --dsw-alias-label-primary: #f9fafb;
+  --dsw-alias-label-secondary: #cfd3d6;
+  --dsw-alias-label-tertiary: #adb2b8;
+  --dsw-alias-label-primary-foreground: #0f1115;
+
+  --dsw-alias-border-l1: rgba(255, 255, 255, 0.06);
+  --dsw-alias-border-l2: rgba(255, 255, 255, 0.12);
+
+  /* 近似值（宿主运行时注入，仓库内无定义） */
+  --dsw-alias-fill-tsp-secondary: rgba(255, 255, 255, 0.08);
+
+  /* 深色下主品牌反转为近白（与 DSH 深色主题一致） */
+  --dsw-alias-brand-primary: #f9fafb;
+
+  --dsw-alias-state-success-primary: #22c55e;
+  --dsw-alias-state-warn-primary: #f59e0b;
+  --dsw-alias-state-error-primary: #f25a5a;
+}
+
+/* ---------- 页面基底（替代 DSH 宿主设置弹窗的容器职责） ---------- */
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+}
+
+body {
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
+  font-size: 12px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- 应用外框（Codex 独立宿主的最小 chrome） ----------
+ * 只提供页面级容器与主题开关；面板本体视觉完全由原版 CSS 决定。 */
+
+.appShell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.appTopBar {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2, 8px);
+  padding: 8px 16px;
+  background: color-mix(in srgb, var(--dsw-alias-bg-base) 86%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+}
+
+.appBrand {
+  margin-right: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+  user-select: none;
+}
+
+.appBrand svg {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+  color: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 70%, var(--dsw-alias-label-primary));
+}
+
+.appThemeToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: color 140ms cubic-bezier(0.32, 0.72, 0, 1),
+    border-color 140ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.appThemeToggle:hover {
+  color: var(--dsw-alias-label-primary);
+  border-color: color-mix(in srgb, var(--dsw-alias-label-primary) 22%, var(--dsw-alias-border-l2));
+}
+
+.appThemeToggle svg {
+  width: 13px;
+  height: 13px;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+  flex: none;
+}
+
+.appMain {
+  flex: 1;
+  width: 100%;
+  padding: 16px 20px 48px;
+  box-sizing: border-box;
+}
+
+/* 窄屏收窄外框 padding，面板内部已有 720/960px 两档响应式断点 */
+@media (max-width: 720px) {
+  .appMain {
+    padding: 12px 12px 40px;
+  }
+}
