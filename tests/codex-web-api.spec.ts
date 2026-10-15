@@ -3,16 +3,18 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
-import type { IncomingMessage } from 'node:http'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpRequest } from 'node:http'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { openCodexRuntime } from '../codex/src/runtime.ts'
 import type { CodexRuntime } from '../codex/src/runtime.ts'
 import { createWebServer } from '../codex/web/server.ts'
 import type { WebServer } from '../codex/web/server.ts'
+import { handleEngramApi } from '../codex/web/api.ts'
 import {
   InvalidSelectorError, UnknownProjectError, createProjectRegistry, scanProjectDbs,
 } from '../codex/web/projects.ts'
+import type { ProjectRegistry } from '../codex/web/projects.ts'
 import { cookieValue, readJsonBody } from '../codex/web/auth.ts'
 
 /** 固定测试令牌（生产由进程随机生成；测试需要可预测值）。 */
@@ -343,7 +345,8 @@ describe('codex/web — 路由状态与静态分发', () => {
     const dbDir = await tempDir('codex-web-route-')
     const { base } = await startServer({ dbDir })
 
-    const pending = await fetch(`${base}/api/engram/telemetry`, { headers: bearer() })
+    // D2.2 已实装 telemetry 等 16 个查询路由；501 探测改用 D2.3 的 export（写操作与导出阶段）。
+    const pending = await fetch(`${base}/api/engram/export`, { headers: bearer() })
     expect(pending.status).toBe(501)
     expect((await pending.json()).error).toContain('not implemented yet')
 
@@ -481,5 +484,410 @@ describe('codex/web — 单元：body 限制、Cookie 解析、分库扫描', ()
     expect(target).toMatchObject({ scope: 'project', projectRoot: repoA, dbName: runtime.scopeDbName('project', repoA) })
     const userTarget = await rooted.resolve('user')
     expect(userTarget).toEqual({ scope: 'user', dbName: 'user.db' })
+  })
+})
+
+describe('codex/web — D2.2 核心查询（真实 SQLite，无 Mock）', () => {
+  it('空库：查询路由全部返回合法空结构，且读路径不建库', async () => {
+    const dbDir = await tempDir('codex-web-d22-empty-')
+    const { base } = await startServer({ dbDir })
+    const get = async (path: string): Promise<unknown> =>
+      (await fetch(`${base}/api/engram/${path}`, { headers: bearer() })).json()
+
+    expect(await get('review-due?scope=user')).toEqual({ scope: 'user', items: [] })
+    expect(await get('search-test?q=anything&scope=all')).toEqual({ degraded: true, hits: [] })
+    expect(await get('activity?limit=50')).toEqual({ operations: [] })
+    expect(await get('profile-block?scope=user')).toEqual({ scope: 'user', block: null, versions: [] })
+    expect(await get('entities?scope=user')).toEqual({ scope: 'user', items: [], total: 0 })
+    expect(await get('facts?scope=user&entityId=x')).toEqual({ scope: 'user', items: [], total: 0 })
+    expect(await get('observations?scope=user')).toEqual({ scope: 'user', items: [], total: 0 })
+    expect(await get('observation-evidence?scope=user&ids=a,b')).toEqual({ scope: 'user', items: [] })
+    expect(await get('episode-timeline?scope=user')).toEqual({ groups: [] })
+    expect(await get('corridor?scope=user')).toEqual({ scope: 'user', nodes: [], edges: [] })
+    expect(await get('telemetry?days=7')).toMatchObject({ counts: { writes: 0 }, scopes: [] })
+    expect(await get('health')).toEqual({ overall: 0, parts: [], evaluatedAt: expect.any(Number) })
+    expect(await get('tour-proposal?scope=user')).toMatchObject({ scope: 'empty', empty: true, activeCount: 0, suggestedStops: [] })
+    expect(await get('refurb?scope=user')).toEqual({ scope: 'user', count: 0, suggestions: [] })
+
+    // review / entity 是单条目语义：库不存在 → 404（不是空结构，也不建库）
+    expect((await fetch(`${base}/api/engram/review?scope=user&id=x`, { headers: bearer() })).status).toBe(404)
+    expect((await fetch(`${base}/api/engram/entity?scope=user&id=x`, { headers: bearer() })).status).toBe(404)
+
+    // 读路径不建库：user.db 与任何项目库都不应出现
+    expect(existsSync(join(dbDir, 'user.db'))).toBe(false)
+    expect(scanProjectDbs(dbDir)).toEqual([])
+  })
+
+  it('review：详情/修订链/操作日志取自真实库；缺 id 400、未知 id 404', async () => {
+    const dbDir = await tempDir('codex-web-d22-review-')
+    const { runtime, base } = await startServer({ dbDir })
+    const saved = await runtime.save({ content: '约定：提交前先跑 typecheck', kind: 'decision', scope: 'user' })
+    const revised = await runtime.update({ id: saved.record.id, content: '约定：提交前先跑 typecheck 与单测', scope: 'user' })
+
+    const view = await (await fetch(`${base}/api/engram/review?scope=user&id=${encodeURIComponent(revised.id)}`, { headers: bearer() })).json()
+    expect(view.record.content).toContain('typecheck 与单测')
+    expect(view.supersedes).toContain(saved.record.id)
+    expect(view.operations.map((op: { op: string }) => op.op)).toContain('update')
+
+    // 旧条目视角：状态归档 + 被谁取代 + superseded 审计行 + 修订快照均可回溯
+    //（修订快照挂在被取代的旧条目上——内容不变性审计）
+    const oldView = await (await fetch(`${base}/api/engram/review?scope=user&id=${encodeURIComponent(saved.record.id)}`, { headers: bearer() })).json()
+    expect(oldView.record.status).toBe('archived')
+    expect(oldView.supersededBy).toContain(revised.id)
+    expect(oldView.operations.map((op: { op: string }) => op.op)).toContain('superseded')
+    expect(oldView.revisions.length).toBeGreaterThanOrEqual(1)
+    expect(oldView.revisions[0].content).toContain('提交前先跑 typecheck')
+
+    const noId = await fetch(`${base}/api/engram/review?scope=user`, { headers: bearer() })
+    expect(noId.status).toBe(400)
+    const missing = await fetch(`${base}/api/engram/review?scope=user&id=nope`, { headers: bearer() })
+    expect(missing.status).toBe(404)
+  })
+
+  it('review-due：到期队列只给线索（无正文），逾期天数来自真实调度', async () => {
+    const dbDir = await tempDir('codex-web-d22-due-')
+    const { runtime, base } = await startServer({ dbDir })
+    const store = await runtime.openScope('user')
+    const due = await store.write({ scope: 'user', kind: 'fact', content: '明天要复习的秘密内容', initialReviewAt: Date.now() - 2 * 86_400_000 })
+    await store.write({ scope: 'user', kind: 'fact', content: '还没到期的条目', initialReviewAt: Date.now() + 5 * 86_400_000 })
+
+    const body = await (await fetch(`${base}/api/engram/review-due?scope=user`, { headers: bearer() })).json()
+    expect(body.scope).toBe('user')
+    expect(body.items).toHaveLength(1)
+    expect(body.items[0].id).toBe(due.id)
+    expect(body.items[0].overdueDays).toBeGreaterThanOrEqual(2)
+    expect(body.items[0].reps).toBe(0)
+    expect(body.items[0].nextReviewAt).toBeLessThan(Date.now())
+    // 检索练习：线索视图不给正文
+    expect(JSON.stringify(body)).not.toContain('秘密内容')
+  })
+
+  it('search-test：真实检索——分数/命中原委/降级标注；q 必填、shared 501', async () => {
+    const dbDir = await tempDir('codex-web-d22-bench-')
+    const repoA = await makeRepo('git@github.com:acme/alpha.git')
+    const { runtime, base } = await startServer({ dbDir })
+    await runtime.save({ content: '编译产物在 dist 目录', kind: 'fact', scope: 'user' })
+    await runtime.save({ content: 'Alpha 项目用 pnpm 构建', kind: 'fact', projectRoot: repoA })
+    const dbA = runtime.scopeDbName('project', repoA)
+
+    // 合并视图（面板 forceProject 语义：带选择器时项目段参与）
+    const bench = await (await fetch(`${base}/api/engram/search-test?q=pnpm&scope=all&project=${dbA}`, { headers: bearer() })).json()
+    expect(bench.degraded).toBe(true) // Codex 默认 embedding:'off' → 语义道缺失，如实标注降级
+    expect(bench.hits).toHaveLength(1)
+    expect(bench.hits[0]).toMatchObject({ scope: 'project', kind: 'fact', via: 'fts' })
+    expect(bench.hits[0].score).toBeGreaterThan(0)
+    expect(bench.hits[0].content).toContain('pnpm')
+
+    // 单 scope 严格：user 库检索不到项目库内容（项目隔离）
+    const userOnly = await (await fetch(`${base}/api/engram/search-test?q=pnpm&scope=user`, { headers: bearer() })).json()
+    expect(userOnly.hits).toHaveLength(0)
+
+    const noQ = await fetch(`${base}/api/engram/search-test?scope=user`, { headers: bearer() })
+    expect(noQ.status).toBe(400)
+    const shared = await fetch(`${base}/api/engram/search-test?q=pnpm&scope=shared`, { headers: bearer() })
+    expect(shared.status).toBe(501)
+  })
+
+  it('activity：合并两库 op_log（带 scope 标签），项目段跟随选择器', async () => {
+    const dbDir = await tempDir('codex-web-d22-activity-')
+    const repoA = await makeRepo('git@github.com:acme/alpha.git')
+    const { runtime, base } = await startServer({ dbDir })
+    await runtime.save({ content: '用户侧偏好：深色模式', kind: 'preference', scope: 'user' })
+    await runtime.save({ content: 'Alpha 约定', kind: 'decision', projectRoot: repoA })
+    const dbA = runtime.scopeDbName('project', repoA)
+
+    // 无选择器：项目段跳过（Codex 不回落进程 cwd）——不报错，也不虚构项目操作
+    const noSelector = await (await fetch(`${base}/api/engram/activity?limit=50`, { headers: bearer() })).json()
+    expect(noSelector.operations.every((op: { scope: string }) => op.scope === 'user')).toBe(true)
+    expect(noSelector.operations.some((op: { op: string }) => op.op === 'write')).toBe(true)
+
+    // 带选择器：两库合并、时间倒序
+    const merged = await (await fetch(`${base}/api/engram/activity?limit=50&project=${dbA}`, { headers: bearer() })).json()
+    expect(merged.operations.some((op: { scope: string }) => op.scope === 'project')).toBe(true)
+    const times = merged.operations.map((op: { at: number }) => op.at)
+    expect([...times].sort((a, b) => b - a)).toEqual(times)
+  })
+
+  it('profile-block：当前态 + 版本链（新→旧）；未创建时 block 为 null', async () => {
+    const dbDir = await tempDir('codex-web-d22-profile-')
+    const { runtime, base } = await startServer({ dbDir })
+    const empty = await (await fetch(`${base}/api/engram/profile-block?scope=user`, { headers: bearer() })).json()
+    expect(empty).toMatchObject({ scope: 'user', block: null, versions: [] })
+
+    const store = await runtime.openScope('user')
+    await store.saveProfileBlock('user', undefined, '第一版画像', 'edit')
+    await store.saveProfileBlock('user', 1, '第二版画像', 'edit')
+    const view = await (await fetch(`${base}/api/engram/profile-block?scope=user`, { headers: bearer() })).json()
+    expect(view.block).toMatchObject({ content: '第二版画像', version: 2 })
+    expect(view.versions.map((v: { version: number }) => v.version)).toEqual([2, 1])
+    expect(view.versions[0]).toMatchObject({ source: 'edit', content: '第二版画像' })
+  })
+
+  it('entities/entity/facts：实体词典、详情与事实版本链（含 asOf 时点回看）', async () => {
+    const dbDir = await tempDir('codex-web-d22-entity-')
+    const { runtime, base } = await startServer({ dbDir })
+    const store = await runtime.openScope('user')
+    const node = await store.write({ scope: 'user', kind: 'fact', content: '张三负责编译系统' })
+    const [entity] = await store.resolveEntities([{ name: '张三', kind: 'person', aliases: ['老张'] }])
+    await store.linkNodeEntities(node.id, [entity!.id])
+    const day = 86_400_000
+    const [oldFact] = await store.writeFacts([{ entityId: entity!.id, content: '张三在 A 组', validAt: Date.now() - 2 * day }])
+    const [freshFact] = await store.writeFacts([{ entityId: entity!.id, content: '张三调到 B 组', validAt: Date.now() - day, replaces: oldFact!.id }])
+
+    const list = await (await fetch(`${base}/api/engram/entities?scope=user`, { headers: bearer() })).json()
+    expect(list.total).toBe(1)
+    expect(list.items[0].entity).toMatchObject({ name: '张三', kind: 'person', aliases: ['老张'] })
+    expect(list.items[0].memoryCount).toBe(1)
+
+    const detail = await (await fetch(`${base}/api/engram/entity?scope=user&id=${encodeURIComponent(entity!.id)}`, { headers: bearer() })).json()
+    expect(detail.entity.name).toBe('张三')
+    expect(detail.memories.map((m: { content: string }) => m.content)).toEqual(['张三负责编译系统'])
+
+    // 全链：新事实有效、旧事实软失效并回指 replacedBy（版本链可回溯）
+    const chain = await (await fetch(`${base}/api/engram/facts?scope=user&entityId=${encodeURIComponent(entity!.id)}&includeInvalid=1`, { headers: bearer() })).json()
+    expect(chain.total).toBe(2)
+    expect(chain.items[0]).toMatchObject({ content: '张三调到 B 组', invalidAt: null })
+    expect(chain.items[1]).toMatchObject({ content: '张三在 A 组', replacedBy: freshFact!.id })
+    expect(chain.items[1].invalidAt).not.toBeNull()
+
+    // asOf 时点回看：只看「张三在 A 组」仍有效的时刻
+    const asOf = await (await fetch(`${base}/api/engram/facts?scope=user&entityId=${encodeURIComponent(entity!.id)}&asOf=${Date.now() - 3 * day / 2}`, { headers: bearer() })).json()
+    expect(asOf.items).toHaveLength(1)
+    expect(asOf.items[0].content).toBe('张三在 A 组')
+
+    const noEntityId = await fetch(`${base}/api/engram/facts?scope=user`, { headers: bearer() })
+    expect(noEntityId.status).toBe(400)
+    const unknownEntity = await fetch(`${base}/api/engram/entity?scope=user&id=nope`, { headers: bearer() })
+    expect(unknownEntity.status).toBe(404)
+  })
+
+  it('observations / observation-evidence：信念列表（状态筛选）与证据链回溯', async () => {
+    const dbDir = await tempDir('codex-web-d22-belief-')
+    const { runtime, base } = await startServer({ dbDir })
+    // 空态
+    const empty = await (await fetch(`${base}/api/engram/observations?scope=user`, { headers: bearer() })).json()
+    expect(empty).toEqual({ scope: 'user', items: [], total: 0 })
+
+    const store = await runtime.openScope('user')
+    const n1 = await store.write({ scope: 'user', kind: 'fact', content: '证据一：构建要三分钟' })
+    const n2 = await store.write({ scope: 'user', kind: 'fact', content: '证据二：测试要两分钟' })
+    const obs = await store.createObservation({ scope: 'user', belief: 'CI 全流程约五分钟', sourceIds: [n1.id, n2.id] })
+    const stale = await store.createObservation({ scope: 'user', belief: '待复核的信念', sourceIds: [n1.id] })
+    await store.markObservationStale(stale.id)
+
+    const all = await (await fetch(`${base}/api/engram/observations?scope=user`, { headers: bearer() })).json()
+    expect(all.total).toBe(2)
+    const ci = all.items.find((row: { id: string }) => row.id === obs.id)
+    expect(ci).toMatchObject({ belief: 'CI 全流程约五分钟', status: 'active', proofCount: 2 })
+    expect(ci.sourceIds).toEqual([n1.id, n2.id])
+
+    const staleOnly = await (await fetch(`${base}/api/engram/observations?scope=user&status=stale`, { headers: bearer() })).json()
+    expect(staleOnly.total).toBe(1)
+    expect(staleOnly.items[0].id).toBe(stale.id)
+
+    // 证据链：sourceIds → 原始记忆行（只读回查）
+    const evidence = await (await fetch(`${base}/api/engram/observation-evidence?scope=user&ids=${encodeURIComponent(`${n1.id},${n2.id}`)}`, { headers: bearer() })).json()
+    expect(evidence.items.map((r: { content: string }) => r.content).sort()).toEqual(['证据一：构建要三分钟', '证据二：测试要两分钟'])
+
+    const noIds = await fetch(`${base}/api/engram/observation-evidence?scope=user`, { headers: bearer() })
+    expect(noIds.status).toBe(400)
+  })
+
+  it('episode-timeline：分组模式（组头摘要）与邻近扩展；锚点不存在 404', async () => {
+    const dbDir = await tempDir('codex-web-d22-episode-')
+    const { runtime, base } = await startServer({ dbDir })
+    // 空库先查一次：合法空结构 + 不建库
+    const empty = await (await fetch(`${base}/api/engram/episode-timeline?scope=user`, { headers: bearer() })).json()
+    expect(empty).toEqual({ groups: [] })
+    expect(existsSync(join(dbDir, 'user.db'))).toBe(false)
+
+    const store = await runtime.openScope('user')
+    const e1 = await store.write({ scope: 'user', kind: 'episode', content: '第一天：立项', sourceSessionId: 'sess-1' })
+    const e2 = await store.write({ scope: 'user', kind: 'episode', content: '第一天：评审', sourceSessionId: 'sess-1' })
+    await store.write({ scope: 'user', kind: 'episode', content: '第二天：开发', sourceSessionId: 'sess-2' })
+    await store.setSessionSummary('sess-1', '立项与评审')
+
+    const groups = await (await fetch(`${base}/api/engram/episode-timeline?scope=user`, { headers: bearer() })).json()
+    expect(groups.groups).toHaveLength(2)
+    const g1 = groups.groups.find((g: { sessionId: string }) => g.sessionId === 'sess-1')
+    expect(g1.summary).toBe('立项与评审')
+    expect(g1.episodes.map((e: { content: string }) => e.content)).toEqual(['第一天：立项', '第一天：评审'])
+    expect(g1.startedAt).toBeLessThanOrEqual(g1.endedAt)
+    // 无摘要的组不带 summary 键（面板据此显示「摘要缺失」）
+    const g2 = groups.groups.find((g: { sessionId: string }) => g.sessionId === 'sess-2')
+    expect(g2.summary).toBeUndefined()
+
+    // 邻近扩展：锚点 ±60 分钟窗口内的情景邻居（排除锚点自身）
+    const around = await (await fetch(`${base}/api/engram/episode-timeline?scope=user&around=${encodeURIComponent(e1.id)}`, { headers: bearer() })).json()
+    expect(around.anchor.id).toBe(e1.id)
+    expect(around.neighbors.map((n: { id: string }) => n.id)).toContain(e2.id)
+    expect(around.neighbors.map((n: { id: string }) => n.id)).not.toContain(e1.id)
+
+    const missing = await fetch(`${base}/api/engram/episode-timeline?scope=user&around=nope`, { headers: bearer() })
+    expect(missing.status).toBe(404)
+  })
+
+  it('corridor：节点/边来自真实库，status 过滤生效；项目切换图谱同步', async () => {
+    const dbDir = await tempDir('codex-web-d22-corridor-')
+    const repoA = await makeRepo('git@github.com:acme/alpha.git')
+    const repoB = await makeRepo('git@github.com:acme/beta.git')
+    const { runtime, base } = await startServer({ dbDir })
+    const a1 = await runtime.save({ content: 'Alpha 约定一', kind: 'decision', projectRoot: repoA })
+    const a2 = await runtime.save({ content: 'Alpha 约定二', kind: 'fact', projectRoot: repoA })
+    await runtime.save({ content: 'Beta 约定', kind: 'fact', projectRoot: repoB })
+    const storeA = await runtime.openScope('project', repoA)
+    await storeA.linkEdge(a2.record.id, a1.record.id, 'related')
+    const dbA = runtime.scopeDbName('project', repoA)
+    const dbB = runtime.scopeDbName('project', repoB)
+
+    const graphA = await (await fetch(`${base}/api/engram/corridor?scope=project&project=${dbA}&status=active,archived`, { headers: bearer() })).json()
+    expect(graphA.nodes).toHaveLength(2)
+    expect(graphA.edges).toHaveLength(1)
+    expect(graphA.edges[0]).toMatchObject({ from: a2.record.id, to: a1.record.id, type: 'related' })
+    expect(graphA.nodes.map((n: { content: string }) => n.content).sort()).toEqual(['Alpha 约定一', 'Alpha 约定二'])
+    expect(graphA.nodes.every((n: { title: string; importance: number }) => typeof n.title === 'string' && n.importance >= 0)).toBe(true)
+
+    // status 过滤（与 DSH 同口径：active 恒包含，显式追加 archived/forgotten）：
+    // 修正一条后旧条目转 archived——默认只画 active，显式加 archived 才可见。
+    await runtime.update({ id: a2.record.id, content: 'Alpha 约定二（修订）', projectRoot: repoA })
+    const activeOnly = await (await fetch(`${base}/api/engram/corridor?scope=project&project=${dbA}`, { headers: bearer() })).json()
+    expect(activeOnly.nodes.map((n: { content: string }) => n.content).sort()).toEqual(['Alpha 约定一', 'Alpha 约定二（修订）'])
+    expect(activeOnly.edges).toHaveLength(0) // 旧条目（边的一端）已不在 active 子图
+    const withArchived = await (await fetch(`${base}/api/engram/corridor?scope=project&project=${dbA}&status=active,archived`, { headers: bearer() })).json()
+    expect(withArchived.nodes).toHaveLength(3)
+    expect(withArchived.nodes.map((n: { status: string }) => n.status).sort()).toEqual(['active', 'active', 'archived'])
+    expect(withArchived.edges).toHaveLength(2) // 旧 related 边 + update 产生的 supersedes 边
+    expect(withArchived.edges.map((e: { type: string }) => e.type).sort()).toEqual(['related', 'supersedes'])
+
+    // 切换项目：图谱同步换成 B 库（无 A 的节点/边）
+    const graphB = await (await fetch(`${base}/api/engram/corridor?scope=project&project=${dbB}`, { headers: bearer() })).json()
+    expect(graphB.nodes).toHaveLength(1)
+    expect(graphB.nodes[0].content).toBe('Beta 约定')
+    expect(graphB.edges).toHaveLength(0)
+  })
+
+  it('telemetry：近 N 天计数来自 op_log；只聚合 user/project；shared 501', async () => {
+    const dbDir = await tempDir('codex-web-d22-tele-')
+    const repoA = await makeRepo('git@github.com:acme/alpha.git')
+    const { runtime, base } = await startServer({ dbDir })
+    await runtime.save({ content: '用户库写入', kind: 'fact', scope: 'user' })
+    await runtime.save({ content: 'Alpha 写入', kind: 'fact', projectRoot: repoA })
+    const dbA = runtime.scopeDbName('project', repoA)
+
+    // 合并（无 scope）：无选择器时项目段跳过（不回落进程 cwd），只聚合 user
+    const mergedNoSel = await (await fetch(`${base}/api/engram/telemetry?days=7`, { headers: bearer() })).json()
+    expect(mergedNoSel.counts.writes).toBe(1)
+    expect(mergedNoSel.scopes.map((s: { scope: string }) => s.scope)).toEqual(['user'])
+
+    // 带选择器的合并：两库都聚合
+    const merged = await (await fetch(`${base}/api/engram/telemetry?days=7&project=${dbA}`, { headers: bearer() })).json()
+    expect(merged.counts.writes).toBe(2)
+    expect(merged.scopes.map((s: { scope: string }) => s.scope).sort()).toEqual(['project', 'user'])
+
+    const userOnly = await (await fetch(`${base}/api/engram/telemetry?days=7&scope=user`, { headers: bearer() })).json()
+    expect(userOnly.counts.writes).toBe(1)
+    expect(userOnly.scopes).toEqual([{ scope: 'user', active: 1, total: 1, signalRatio: 1 }])
+
+    const projOnly = await (await fetch(`${base}/api/engram/telemetry?days=7&scope=project&project=${dbA}`, { headers: bearer() })).json()
+    expect(projOnly.counts.writes).toBe(1)
+    expect(projOnly.scopes).toEqual([{ scope: 'project', active: 1, total: 1, signalRatio: 1 }])
+
+    // 项目段无选择器 → 404（不静默回落、不返回空数据假装成功）
+    const noSelector = await fetch(`${base}/api/engram/telemetry?days=7&scope=project`, { headers: bearer() })
+    expect(noSelector.status).toBe(404)
+
+    const shared = await fetch(`${base}/api/engram/telemetry?days=7&scope=shared`, { headers: bearer() })
+    expect(shared.status).toBe(501)
+  })
+
+  it('health：五维评分取自真实 stats（1 条 active = 76 分公式核验）', async () => {
+    const dbDir = await tempDir('codex-web-d22-health-')
+    const repoA = await makeRepo('git@github.com:acme/alpha.git')
+    const { runtime, base } = await startServer({ dbDir, projectRoot: repoA })
+
+    // 空态：两库都不存在 → parts 空、overall 0
+    const empty = await (await fetch(`${base}/api/engram/health`, { headers: bearer() })).json()
+    expect(empty.parts).toEqual([])
+    expect(empty.overall).toBe(0)
+
+    await runtime.save({ content: 'Alpha 约定', kind: 'decision', projectRoot: repoA })
+    const view = await (await fetch(`${base}/api/engram/health?scope=project`, { headers: bearer() })).json()
+    expect(view.parts).toHaveLength(1)
+    expect(view.parts[0].scope).toBe('project')
+    // 1 active / 0 archived / 0 edges / 0 redacted：
+    // 40（信噪比 1.0）+ 25×(1−0.15/0.85)（活跃率）+ 0（走廊密度）+ 10（无涂改）+ 5（衰减覆盖一半）= 75.59 → 76
+    expect(view.parts[0].score).toBe(76)
+    expect(view.parts[0]).toMatchObject({ signal: 1, activeRatio: 1, edgeCount: 0, redacted: 0, archivedRatio: 0 })
+    expect(typeof view.evaluatedAt).toBe('number')
+
+    // 合并视图：配置了默认项目根 → 两库各一段
+    const merged = await (await fetch(`${base}/api/engram/health`, { headers: bearer() })).json()
+    expect(merged.parts.map((p: { scope: string }) => p.scope)).toEqual(['project'])
+    expect(merged.overall).toBe(76)
+  })
+
+  it('tour-proposal：空宫殿引导 + active 记忆开场建议（≤5 站，focusKind 优先）', async () => {
+    const dbDir = await tempDir('codex-web-d22-tour-')
+    const { runtime, base } = await startServer({ dbDir })
+    const empty = await (await fetch(`${base}/api/engram/tour-proposal?scope=user`, { headers: bearer() })).json()
+    expect(empty).toMatchObject({ scope: 'empty', empty: true, activeCount: 0, suggestedStops: [] })
+    expect(empty.greeting).toContain('宫殿尚空')
+
+    await runtime.save({ content: '最重要的决策', kind: 'decision', scope: 'user', importance: 0.9 })
+    for (let i = 0; i < 6; i += 1) {
+      await runtime.save({ content: `普通约定 ${i}`, kind: 'fact', scope: 'user', importance: 0.1 })
+    }
+    const view = await (await fetch(`${base}/api/engram/tour-proposal?scope=user`, { headers: bearer() })).json()
+    expect(view).toMatchObject({ scope: 'user', empty: false, activeCount: 7 })
+    expect(view.suggestedStops).toHaveLength(5)
+    expect(view.suggestedStops[0]).toMatchObject({ kind: 'decision', content: '最重要的决策' })
+
+    const focused = await (await fetch(`${base}/api/engram/tour-proposal?scope=user&focusKind=fact`, { headers: bearer() })).json()
+    expect(focused.suggestedStops.every((s: { kind: string }) => s.kind === 'fact')).toBe(true)
+  })
+
+  it('refurb：小库早退（无建议）；门牌纪律等规则给出 review 建议', async () => {
+    const dbDir = await tempDir('codex-web-d22-refurb-')
+    const { runtime, base } = await startServer({ dbDir })
+    // 少于 minActive(8)：样本太少，早退不出建议
+    await runtime.save({ content: '唯一条目', kind: 'fact', scope: 'user' })
+    const small = await (await fetch(`${base}/api/engram/refurb?scope=user`, { headers: bearer() })).json()
+    expect(small).toEqual({ scope: 'user', count: 0, suggestions: [] })
+
+    for (let i = 0; i < 9; i += 1) {
+      await runtime.save({ content: `未挂门牌的条目 ${i}`, kind: 'fact', scope: 'user', importance: 0.8 })
+    }
+    const view = await (await fetch(`${base}/api/engram/refurb?scope=user`, { headers: bearer() })).json()
+    expect(view.count).toBeGreaterThanOrEqual(1)
+    expect(view.suggestions.every((s: { action: string; primaryId: string; confidence: number }) =>
+      ['merge', 'demote', 'review', 'split'].includes(s.action) && typeof s.primaryId === 'string' && s.confidence > 0)).toBe(true)
+    // 规则 3（重要性 ≥0.7 且从未访问）与规则 5（未挂门牌）都命中
+    expect(view.suggestions.some((s: { action: string; reason: string }) => s.action === 'review')).toBe(true)
+  })
+
+  it('未知异常统一 500 internal error（内部细节只落服务端日志）', async () => {
+    const sent: { status: number; body: string } = { status: 0, body: '' }
+    const res = {
+      writeHead: (status: number) => { sent.status = status },
+      end: (body?: string) => { sent.body = body ?? '' },
+    } as unknown as ServerResponse
+    const req = { method: 'GET' } as unknown as IncomingMessage
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const deps = {
+        runtime: {} as CodexRuntime,
+        projects: {
+          resolve: () => { throw new Error('内部细节：D:\\secret\\path 不应外泄') },
+        } as unknown as ProjectRegistry,
+      }
+      await handleEngramApi(req, res, 'list', new URL('http://127.0.0.1/api/engram/list?scope=user'), deps)
+      expect(sent.status).toBe(500)
+      expect(JSON.parse(sent.body)).toEqual({ error: 'internal error' })
+      expect(sent.body).not.toContain('secret')
+      // 具体信息记录在服务端
+      expect(logged).toHaveBeenCalled()
+    } finally {
+      logged.mockRestore()
+    }
   })
 })

@@ -86,12 +86,58 @@ codex/scripts/smoke-web.mjs
 已知边界（按计划留待后续阶段）：telemetry/health/corridor 等查询路由 D2.1 返回 501；
 写操作与导出 D2.3；backup/restore-backup 不在面板 35 接口内，另行处理。
 
-### D2.2 — 核心查询接口（待实施）
+### D2.2 — 核心查询接口（2026-10-14 落地）
 
 stats/list 之外的查询：review、review-due、search-test、entities、entity、facts、
 observations、observation-evidence、episode-timeline、corridor、telemetry、health、
 tour-proposal、refurb、profile-block、activity。DTO 以 `src/routes.ts` 实际可达分支为基准。
 遥测聚合**只聚合 user/project**（不沿用三库默认吞掉 shared）。
+
+**实施记录**：
+
+- 全部 16 个路由在本文件 `api.ts` 落地（路由表 status `d21 → d22`），只修改
+  `codex/web/api.ts` + 测试/冒烟；未动 Runtime、projects、server。
+- 复用既有实现：`store.review/dueReviews/search/recentOps/getMany/listEntities/
+  entityDetail/factsOfEntity/listObservations/episodeTimeline/exportAll/
+  getProfileBlock/listProfileBlockVersions`；
+  `src/telemetry/aggregate.ts`（遥测聚合）、`src/tour-proposal.ts`（入殿导航）、
+  `src/refurb.ts`（翻新建议）三个纯函数模块零改动直接 import。
+- 读路径统一 `openStoreForRead()`：库不存在返回**接口契约空结构**（列表类空数组 /
+  review·entity 单条目语义 404 / telemetry 空计数 / health `overall:0`），不建空库。
+- 项目定位全部经 `ProjectRegistry.resolve()`；合并视图（search-test all / activity /
+  telemetry·health 无 scope）对「无选择器且无默认根」的项目段**容错跳过**——
+  Codex 不回落 WebAPI 进程 cwd（DSH 的进程目录兜底在 Codex 侧是红线），
+  显式单 scope 仍严格 404（与 list/stats 同口径）。
+- 两处按**面板消费结构**修正的 DSH 既有偏差（均已在代码注释标注）：
+  ① `episode-timeline` around 模式返回扁平 `{anchor, neighbors}`（DSH 多包一层
+  `around` 键，与面板 `EpisodeAroundView` 不符，原版邻近扩展会崩）；
+  ② `facts` 的 `includeInvalid` 放行 `1/0`（DSH 的 toBoolean 不认 `'1'`，
+  面板实际发 `includeInvalid=1`，原版全链视图拿不到失效事实）。
+- 500 错误泄露修正：未知异常响应统一 `internal error`，完整信息（含堆栈）只落
+  服务端 `console.error`。
+- 测试：`tests/codex-web-api.spec.ts` 19 → **34 断言**（新增 15 个：16 路由逐个
+  真实数据核验 + 空库空结构 + 项目切换同步 + 500 不泄露单测）；
+  `smoke-web.mjs` ⑦b 新增 16 接口真实数据冒烟（501 探测改用 D2.3 的 export）。
+
+**实测结果（2026-10-14）**：
+
+- `tsc --noEmit`：`codex/` 与 `tests/codex-*` 零错误；总数 109 = D1 基线
+  （既有失败均为未 link-peers 的 `@deepseek-ai/*` 环境问题）。
+- vitest：`tests/codex-web-api.spec.ts` **34/34**；codex 六件套合计 **91/91**
+  （D1 基线 76 = 57 + 19，其中 web-api 19 → 34）。
+- `pnpm bundle:codex` → `dist/web.js` 58.34 kB（D2.1 为 31.47 kB）；
+  `pnpm build:ui` → 24 模块，JS 261 kB / CSS 57 kB（UI 零改动）。
+- `node codex/scripts/smoke-web.mjs`（真实子进程 + 构建产物）**全部通过**：
+  含 ⑦b 十六接口真实 SQLite 冒烟与 shared 501。
+- `smoke.mjs`（MCP）与 `smoke-hooks.mjs`（Hooks 8 步）**全部通过**（无回归）。
+- D1 渲染基线回归：mock dev + `verify-render.mjs` **51/51 通过**。
+- **隔离测试库 + 真实 WebAPI 浏览器验收**（一次性脚本，已清理）：临时库种子数据
+  覆盖九视图全部数据源，dist 构建起服务于 3928、Vite 代理模式 3927、系统 Chrome
+  驱动——认证门（未认证 401 → /auth 换 Cookie → 面板加载）、今日速览
+  （stats/telemetry/health/tour-proposal/profile-block）、陈展 + review 详情抽屉、
+  走廊图谱（节点/边）+ 召回测试台（命中与命中原委）、往事分组 + 会话摘要 + 邻近
+  扩展、实体详情 + 事实版本链（生效/已失效）、信念 + 证据链回溯、活动日志、
+  私人/项目作用域隔离（不串库）、全页面无 4xx/5xx——**30/30 通过**。
 
 ### D2.3 — 写操作、导出、功能边界（待实施）
 

@@ -11,6 +11,9 @@
  *   ⑤ Hooks（另一个真实进程）写入 → WebAPI 读取（跨入口数据闭环）
  *   ⑥ 未知项目选择器 404 unknown project；非法选择器 400（路径穿越拒绝）
  *   ⑦ 未落地路由 501；未知路由 404；非 GET/POST 405
+ *   ⑦b D2.2 核心查询 16 接口：review/review-due/search-test/activity/profile-block/
+ *      entities/facts/observations/observation-evidence/episode-timeline/corridor/
+ *      telemetry/health/tour-proposal/refurb 全部读真实 SQLite（Hooks 写入的那条记忆）
  *   ⑧ 静态 UI：未认证回落令牌页 / 认证后按 MIME 分发
  *   ⑨ SIGTERM 优雅退出（句柄释放）
  *
@@ -200,12 +203,79 @@ check('路径穿越选择器 400', traversal.status === 400)
 
 // ---------- ⑦ 路由状态 ----------
 title('⑦ 路由状态')
-const pending = await fetch(`${base}/api/engram/telemetry`, { headers: { authorization: `Bearer ${TOKEN}` } })
+// D2.2 已实装 16 个查询路由；501 探测改用 D2.3 的 export（写操作与导出阶段）。
+const pending = await fetch(`${base}/api/engram/export`, { headers: { authorization: `Bearer ${TOKEN}` } })
 check('未落地路由 501（不假成功）', pending.status === 501)
 const noRoute = await fetch(`${base}/api/engram/no-such-route`, { headers: { authorization: `Bearer ${TOKEN}` } })
 check('未知路由 404', noRoute.status === 404)
 const put = await fetch(`${base}/api/engram/workspaces`, { method: 'PUT', headers: { authorization: `Bearer ${TOKEN}` } })
 check('非 GET/POST 405', put.status === 405)
+
+// ---------- ⑦b D2.2 核心查询（真实 SQLite） ----------
+title('⑦b D2.2 核心查询接口（真实数据，无 Mock）')
+const auth = { authorization: `Bearer ${TOKEN}` }
+const query = async (path) => {
+  const res = await fetch(`${base}/api/engram/${path}`, { headers: auth })
+  return { status: res.status, body: res.status === 200 ? await res.json() : null }
+}
+const dbName = item.dbName
+const recordId = listed.records[0].id
+
+const review = await query(`review?scope=project&project=${encodeURIComponent(dbName)}&id=${encodeURIComponent(recordId)}`)
+check('review：详情 + 操作日志来自真实库',
+  review.body?.record?.content?.includes('pnpm typecheck') === true && Array.isArray(review.body?.operations))
+
+const due = await query(`review-due?scope=project&project=${encodeURIComponent(dbName)}`)
+check('review-due：合法队列结构', Array.isArray(due.body?.items) && due.body?.scope === 'project')
+
+const bench = await query(`search-test?q=${encodeURIComponent('typecheck')}&scope=project&project=${encodeURIComponent(dbName)}`)
+check('search-test：真实检索命中（分数 + 命中原委 + 降级标注）',
+  (bench.body?.hits?.length ?? 0) >= 1 && bench.body.hits[0].score > 0 && bench.body.hits[0].via !== undefined && typeof bench.body.degraded === 'boolean')
+
+const activity = await query(`activity?limit=50&project=${encodeURIComponent(dbName)}`)
+check('activity：含刚写入的操作（project 段跟随选择器）',
+  (activity.body?.operations ?? []).some(op => op.scope === 'project' && op.op === 'write'))
+
+const profile = await query(`profile-block?scope=project&project=${encodeURIComponent(dbName)}`)
+check('profile-block：未创建时空态合法', profile.body?.block === null && Array.isArray(profile.body?.versions))
+
+const entities = await query(`entities?scope=project&project=${encodeURIComponent(dbName)}`)
+check('entities：词典列表结构', Array.isArray(entities.body?.items) && typeof entities.body?.total === 'number')
+
+const facts = await query(`facts?scope=project&project=${encodeURIComponent(dbName)}&entityId=any`)
+check('facts：无数据返回空链', Array.isArray(facts.body?.items) && facts.body?.total === 0)
+
+const beliefs = await query(`observations?scope=project&project=${encodeURIComponent(dbName)}`)
+check('observations：信念列表结构', Array.isArray(beliefs.body?.items) && beliefs.body?.total === 0)
+
+const evidence = await query(`observation-evidence?scope=project&project=${encodeURIComponent(dbName)}&ids=${encodeURIComponent(recordId)}`)
+check('observation-evidence：证据链回溯到原始记忆',
+  evidence.body?.items?.length === 1 && evidence.body.items[0].id === recordId)
+
+const timeline = await query(`episode-timeline?scope=project&project=${encodeURIComponent(dbName)}`)
+check('episode-timeline：分组结构', Array.isArray(timeline.body?.groups))
+
+const corridor = await query(`corridor?scope=project&project=${encodeURIComponent(dbName)}`)
+check('corridor：节点来自真实库',
+  corridor.body?.nodes?.length === 1 && corridor.body.nodes[0].content.includes('pnpm typecheck'))
+
+const telemetry = await query(`telemetry?days=7&scope=project&project=${encodeURIComponent(dbName)}`)
+check('telemetry：聚合到刚发生的写入（只含 user/project）',
+  (telemetry.body?.counts?.writes ?? 0) >= 1 && telemetry.body.scopes[0]?.scope === 'project')
+
+const health = await query(`health?scope=project&project=${encodeURIComponent(dbName)}`)
+check('health：五维评分取自真实 stats',
+  typeof health.body?.overall === 'number' && health.body?.parts?.length === 1)
+
+const tour = await query(`tour-proposal?scope=project&project=${encodeURIComponent(dbName)}`)
+check('tour-proposal：非空宫殿的开场建议',
+  tour.body?.empty === false && (tour.body?.suggestedStops?.length ?? 0) >= 1)
+
+const refurb = await query(`refurb?scope=project&project=${encodeURIComponent(dbName)}`)
+check('refurb：小库早退（无建议）', refurb.body?.count === 0 && Array.isArray(refurb.body?.suggestions))
+
+const sharedTelemetry = await query('telemetry?days=7&scope=shared')
+check('telemetry：shared 作用域显式 501（不触发不存在的库）', sharedTelemetry.status === 501)
 
 // ---------- ⑧ 静态 UI ----------
 title('⑧ 静态 UI 分发')
