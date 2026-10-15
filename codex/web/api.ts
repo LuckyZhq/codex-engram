@@ -11,21 +11,30 @@
  *   profile-block、entities、entity、facts、observations、observation-evidence、
  *   episode-timeline、corridor、telemetry、health、tour-proposal、refurb）——
  *   全部读真实 SQLite，复用 Store 既有方法与 src/ 侧纯函数（遥测聚合/入殿导航/翻新建议）；
- * - D2.3：写操作与导出（update/forget/restore/review-answer/consolidate、export/mirror）。
+ * - D2.3（已落地）：写操作与导出 7 接口（update / forget / restore / review-answer /
+ *   consolidate / export / mirror）——写操作经 **Codex Runtime**（复用脱敏、向量重算、
+ *   取代链与墓志铭逻辑，不复制），整理与导出复用 `src/consolidation/run.ts` 与
+ *   `src/mirror/markdown.ts`；导出路径与响应装配见 `./exports.ts`。
  * 已知但未落地的路由一律 501（明确不可用），不返回假成功；未知路由 404。
  * @module codex-engram/web/api
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { EngramError, asEntityId, asMemoryId } from '../../src/types.ts'
-import type { EngramEntityKind, EngramKind, EngramStatus, ObservationStatus, StoreStats } from '../../src/types.ts'
+import type {
+  EngramEntityKind, EngramKind, EngramStatus, ForgettingTombstone, ObservationStatus,
+  ReviewGrade, StoreStats,
+} from '../../src/types.ts'
 import type { EngramStore } from '../../src/store/interface.ts'
+import { runConsolidation } from '../../src/consolidation/run.ts'
+import { writeMirror } from '../../src/mirror/markdown.ts'
 import { aggregateTelemetry } from '../../src/telemetry/aggregate.ts'
 import { buildTourProposal } from '../../src/tour-proposal.ts'
 import { DEFAULT_REFURB_OPTIONS, gatherRefurbSuggestions } from '../../src/refurb.ts'
 import type { CodexRuntime, CodexScope } from '../src/runtime.ts'
-import { InvalidSelectorError, UnknownProjectError } from './projects.ts'
+import { InvalidSelectorError, UnknownProjectError, locatorOf } from './projects.ts'
 import type { ProjectRegistry } from './projects.ts'
+import { emptyExport, ensurePrivateDir, newExportId, palaceDir, sendExport } from './exports.ts'
 
 /** Codex Runtime 不支持的作用域（DSH 的 shared 未开放）：显式 501，不假成功。 */
 export class ScopeNotSupportedError extends Error {
@@ -35,16 +44,33 @@ export class ScopeNotSupportedError extends Error {
   }
 }
 
+/** 同一分库已有整理任务在跑（进程内串行）：409，不排队、不并发进入整理。 */
+export class ConsolidationBusyError extends Error {
+  constructor(dbName: string) {
+    super(`分库 ${dbName} 已有整理任务在执行（同一库的整理串行，请稍后重试）`)
+    this.name = 'ConsolidationBusyError'
+  }
+}
+
+/** 记忆种类（与 src/types.ts 的 EngramKind 同枚举，路由层校验用）。 */
+const KINDS: readonly string[] = ['fact', 'preference', 'decision', 'episode', 'skill']
+
+/** 单次整理的候选上限（面板一次提交的合并建议条数远小于此，超限是异常请求）。 */
+const MAX_MERGE_CANDIDATES = 50
+
+/** 进程内整理执行标记（按库文件名）：跨库并行不受影响，同库串行。 */
+const CONSOLIDATION_RUNNING = new Set<string>()
+
 /** 分发依赖（server.ts 装配后传入）。 */
 export interface WebApiDeps {
   readonly runtime: CodexRuntime
   readonly projects: ProjectRegistry
 }
 
-/** 路由状态：d21 = D2.1 已落地；d22 = D2.2 已落地；pending = 已知路由、后续阶段落地。 */
+/** 路由状态：d21/d22/d23 = 对应批次已落地；pending = 已知路由、后续阶段落地。 */
 interface RouteEntry {
   readonly methods: readonly ('GET' | 'POST')[]
-  readonly status: 'd21' | 'd22' | 'pending'
+  readonly status: 'd21' | 'd22' | 'd23' | 'pending'
 }
 
 /**
@@ -73,8 +99,8 @@ const ROUTES: Readonly<Record<string, RouteEntry>> = {
   facts: { methods: ['GET'], status: 'd22' },
   observations: { methods: ['GET'], status: 'd22' },
   'observation-evidence': { methods: ['GET'], status: 'd22' },
-  export: { methods: ['GET'], status: 'pending' },
-  mirror: { methods: ['GET'], status: 'pending' },
+  export: { methods: ['GET'], status: 'd23' },
+  mirror: { methods: ['GET'], status: 'd23' },
   models: { methods: ['GET'], status: 'pending' },
   'history-backfill': { methods: ['GET'], status: 'pending' },
   'history-backfill/status': { methods: ['GET'], status: 'pending' },
@@ -83,11 +109,11 @@ const ROUTES: Readonly<Record<string, RouteEntry>> = {
   'jev-test': { methods: ['POST'], status: 'pending' },
   'history-backfill/start': { methods: ['POST'], status: 'pending' },
   'history-backfill/cancel': { methods: ['POST'], status: 'pending' },
-  update: { methods: ['POST'], status: 'pending' },
-  forget: { methods: ['POST'], status: 'pending' },
-  restore: { methods: ['POST'], status: 'pending' },
-  'review-answer': { methods: ['POST'], status: 'pending' },
-  consolidate: { methods: ['POST'], status: 'pending' },
+  update: { methods: ['POST'], status: 'd23' },
+  forget: { methods: ['POST'], status: 'd23' },
+  restore: { methods: ['POST'], status: 'd23' },
+  'review-answer': { methods: ['POST'], status: 'd23' },
+  consolidate: { methods: ['POST'], status: 'd23' },
 }
 
 function json(res: ServerResponse, status: number, body: unknown): void {
@@ -123,13 +149,15 @@ function toFlag(value: unknown): boolean | undefined {
   return undefined
 }
 
+/** POST 项目选择器（面板契约：写操作经 body.project 传选择器）。 */
+function bodySelector(body: Record<string, unknown>): string | undefined {
+  const raw = body['project']
+  return typeof raw === 'string' && raw !== '' ? raw : undefined
+}
+
 /** 项目选择器：GET 走 query，POST 走 body（面板契约：写操作经 body.project 传选择器）。 */
 function selectorOf(searchParams: URLSearchParams, body: Record<string, unknown> | undefined): string | undefined {
-  if (body !== undefined) {
-    const raw = body['project']
-    if (typeof raw === 'string' && raw !== '') return raw
-    return undefined
-  }
+  if (body !== undefined) return bodySelector(body)
   const raw = searchParams.get('project')
   return raw === null || raw === '' ? undefined : raw
 }
@@ -604,12 +632,261 @@ async function handleRefurb(res: ServerResponse, url: URL, deps: WebApiDeps): Pr
   })
 }
 
+// ---------- D2.3：写操作与导出 ----------
+
+/**
+ * 取必填字符串字段；缺失 / 非字符串 / 空白串一律 400。
+ * @returns 字段值；`undefined` = 已响应 400（调用方直接 return）。
+ */
+function requiredString(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const raw = body[key]
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    json(res, 400, { error: `${key} required` })
+    return undefined
+  }
+  return raw
+}
+
+/** 取 body 的 scope（缺省用 fallback）；`shared` 显式 501。 */
+function bodyScope(body: Record<string, unknown>, fallback: CodexScope): CodexScope {
+  const raw = body['scope']
+  return codexScopeOf(typeof raw === 'string' ? raw : null, fallback)
+}
+
+/** 墓志铭三问的三种状态：全不填 / 半填（拒绝）/ 全填。 */
+type TombstoneState = undefined | 'incomplete' | ForgettingTombstone
+
+/**
+ * 解析墓志铭：要么三项都非空（→ `forgetWithTombstone`，审计信息完整），
+ * 要么一项都不给（→ 普通 `forget`）；只填一部分返回 `incomplete` → 400
+ * （半截墓志铭落库等于「关了但说不清为什么关」，不如明确拒绝）。
+ */
+function tombstoneFromBody(body: Record<string, unknown>): TombstoneState {
+  const reason = body['reason']
+  const affects = body['affects']
+  const stillUseful = body['stillUseful']
+  const given = [reason, affects, stillUseful].filter(value => typeof value === 'string' && value.trim() !== '')
+  if (given.length === 0) return undefined
+  if (given.length < 3) return 'incomplete'
+  return {
+    reason: (reason as string).trim(),
+    affects: (affects as string).trim(),
+    stillUseful: (stillUseful as string).trim(),
+  }
+}
+
+/**
+ * update：取代式修改——写入新条目、旧条目归档、建 supersedes 边（不覆盖原文，可审计）。
+ * **脱敏 / 向量重算 / 取代链一律走 Runtime.update**，本层不复制（复制就会漂移）。
+ */
+async function handleUpdate(
+  res: ServerResponse,
+  deps: WebApiDeps,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const id = requiredString(res, body, 'id')
+  if (id === undefined) return
+  const content = requiredString(res, body, 'content')
+  if (content === undefined) return
+  const rawKind = body['kind']
+  if (rawKind !== undefined && rawKind !== null && !KINDS.includes(rawKind as string)) {
+    json(res, 400, { error: `invalid kind: ${String(rawKind)}` })
+    return
+  }
+  let importance: number | undefined
+  if (body['importance'] !== undefined && body['importance'] !== null) {
+    const parsed = toNumber(body['importance'])
+    if (parsed === undefined || parsed < 0 || parsed > 1) {
+      json(res, 400, { error: 'importance must be a finite number 0-1' })
+      return
+    }
+    importance = parsed
+  }
+  const scope = bodyScope(body, 'project')
+  const target = await deps.projects.resolve(scope, bodySelector(body))
+  const record = await deps.runtime.update({
+    id,
+    content,
+    scope: target.scope,
+    ...locatorOf(target),
+    ...(rawKind === undefined || rawKind === null ? {} : { kind: rawKind as EngramKind }),
+    ...(importance === undefined ? {} : { importance }),
+  })
+  json(res, 200, { record, superseded: id })
+}
+
+/**
+ * forget：可恢复软删（不物理删除）。三问齐全时走 `forgetWithTombstone` 落审计。
+ * 定位精确：只动目标库里那条 id，别的库有同 id 条目也不会代劳删除。
+ */
+async function handleForget(
+  res: ServerResponse,
+  deps: WebApiDeps,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const id = requiredString(res, body, 'id')
+  if (id === undefined) return
+  const tombstone = tombstoneFromBody(body)
+  if (tombstone === 'incomplete') {
+    json(res, 400, { error: '墓志铭三问（reason / affects / stillUseful）要么都填要么都不填' })
+    return
+  }
+  const scope = bodyScope(body, 'project')
+  const target = await deps.projects.resolve(scope, bodySelector(body))
+  const record = await deps.runtime.forget(id, {
+    scope: target.scope,
+    ...locatorOf(target),
+    ...(tombstone === undefined ? {} : { tombstone }),
+  })
+  json(res, 200, { record })
+}
+
+/** restore：按原 id 恢复已归档/已软删条目；同 update/forget，只在目标库内定位。 */
+async function handleRestore(
+  res: ServerResponse,
+  deps: WebApiDeps,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const id = requiredString(res, body, 'id')
+  if (id === undefined) return
+  const scope = bodyScope(body, 'project')
+  const target = await deps.projects.resolve(scope, bodySelector(body))
+  const record = await deps.runtime.restore(id, { scope: target.scope, ...locatorOf(target) })
+  json(res, 200, { record })
+}
+
+/**
+ * review-answer：SM-2 复习自评（记得/模糊/忘了 → grade 5/3/1）。
+ * 直接调 `store.scheduleReview`，不复制 SM-2 公式。
+ */
+async function handleReviewAnswer(
+  res: ServerResponse,
+  deps: WebApiDeps,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const id = requiredString(res, body, 'id')
+  if (id === undefined) return
+  const grade = toNumber(body['grade'])
+  if (grade === undefined || !Number.isInteger(grade) || grade < 0 || grade > 5) {
+    json(res, 400, { error: 'grade must be an integer 0-5' })
+    return
+  }
+  const scope = bodyScope(body, 'user')
+  // 只给已存在的条目排期：库不存在 → 404（不为一个失败的写请求建空库）。
+  const store = await openRead(deps, scope, bodySelector(body))
+  const record = store === undefined
+    ? undefined
+    : await store.scheduleReview(asMemoryId(id), grade as ReviewGrade)
+  if (record === undefined) { json(res, 404, { error: `未找到条目 ${id}` }); return }
+  json(res, 200, { id: record.id, review: record.review ?? null })
+}
+
+/**
+ * consolidate：闭馆整理。**两种执行方式必须显式二选一**，不允许缺省静默触发全库整理：
+ * - 局部合并（`candidates`）：只针对面板明确提交的候选集合，**不附带全库归档**，
+ *   不把候选之外的条目卷进来（用户确认的是「合并这 n 条」）；
+ * - 全库整理（`full=true`）：保留既有归档 + 合并逻辑（DSH 默认行为）。
+ *
+ * 同库并发整理 → 409（进程内执行标记，`try/finally` 释放）。
+ */
+async function handleConsolidate(
+  res: ServerResponse,
+  deps: WebApiDeps,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const scope = bodyScope(body, 'user')
+  const target = await deps.projects.resolve(scope, bodySelector(body))
+  const rawCandidates = body['candidates']
+  const full = toFlag(body['full']) === true
+  const candidates = Array.isArray(rawCandidates)
+    ? [...new Set(rawCandidates.filter((value): value is string => typeof value === 'string' && value.trim() !== ''))]
+    : []
+  if (candidates.length === 0 && !full) {
+    json(res, 400, { error: 'consolidate 必须显式指定 candidates（局部合并）或 full=true（全库整理）' })
+    return
+  }
+  if (candidates.length > 0 && full) {
+    json(res, 400, { error: 'candidates 与 full 互斥：局部合并与全库整理只能二选一' })
+    return
+  }
+  if (candidates.length > MAX_MERGE_CANDIDATES) {
+    json(res, 400, { error: `候选条目过多：${String(candidates.length)}（上限 ${String(MAX_MERGE_CANDIDATES)}）` })
+    return
+  }
+  const mode = full ? 'full' : 'partial'
+  const store = await deps.projects.openStoreForRead(target)
+  if (store === undefined) {
+    // 库不存在：两种模式都不做任何事，返回空报告（不建空库、不假成功）。
+    json(res, 200, { archived: 0, merged: 0, skipped: 0, tookMs: 0, scope: target.scope, mode })
+    return
+  }
+  // 候选必须同属目标库：跨库 id 一律拒绝（不在别的库代劳合并）。
+  if (candidates.length > 0) {
+    const found = await store.getMany(candidates.map(asMemoryId))
+    if (found.length !== candidates.length) {
+      const present = new Set(found.map(record => String(record.id)))
+      const missing = candidates.filter(candidate => !present.has(candidate))
+      json(res, 404, { error: `候选条目不在目标库：${missing.slice(0, 3).join('、')}` })
+      return
+    }
+  }
+  if (CONSOLIDATION_RUNNING.has(target.dbName)) throw new ConsolidationBusyError(target.dbName)
+  CONSOLIDATION_RUNNING.add(target.dbName)
+  try {
+    const report = await runConsolidation(store, deps.runtime.ensureEmbedder(), {
+      scope: target.scope,
+      mode,
+      ...(candidates.length === 0 ? {} : { mergeCandidateIds: candidates }),
+    })
+    json(res, 200, { ...report, scope: target.scope, mode })
+  } finally {
+    CONSOLIDATION_RUNNING.delete(target.dbName)
+  }
+}
+
+/**
+ * export：Markdown / JSON 下载（**只读数据库**，不落盘）。
+ * 面板走 `<a href>` 直链 + Cookie 认证，无需改成 Bearer 请求。
+ */
+async function handleExport(res: ServerResponse, url: URL, deps: WebApiDeps): Promise<void> {
+  const scope = codexScopeOf(url.searchParams.get('scope'), 'user')
+  const format = url.searchParams.get('format') === 'json' ? 'json' : 'markdown'
+  const store = await openRead(deps, scope, selectorOf(url.searchParams, undefined))
+  sendExport(res, format, scope, store === undefined ? emptyExport() : await store.exportAll())
+}
+
+/**
+ * mirror：服务端生成分房间 Markdown 文件树，返回**生成报告 JSON**（原 DSH 契约，
+ * 不是 ZIP 下载）。输出目录 `<dbDir>/palaces/<scope>/<项目库标识>/<导出批次 id>`：
+ * 三层隔离保证跨项目、同秒导出互不覆盖（详见 ./exports.ts）。
+ */
+async function handleMirror(res: ServerResponse, url: URL, deps: WebApiDeps): Promise<void> {
+  const scope = codexScopeOf(url.searchParams.get('scope'), 'user')
+  const target = await deps.projects.resolve(scope, selectorOf(url.searchParams, undefined))
+  const store = await deps.projects.openStoreForRead(target)
+  const data = store === undefined ? emptyExport() : await store.exportAll()
+  const exportId = newExportId()
+  const rootDir = palaceDir(deps.runtime.dbDir, target.scope, target.dbName, exportId)
+  await ensurePrivateDir(rootDir)
+  const report = await writeMirror(rootDir, data)
+  json(res, 200, {
+    ...report,
+    scope: target.scope,
+    exportId,
+    memoryCount: data.records.length,
+    edgeCount: data.edges.length,
+  })
+}
+
 /**
  * 分发一个 `/api/engram/*` 请求（调用方已完成认证与回环守卫）。
  * @param route - `/api/engram/` 之后的路径（不含 query）。
- * @param _body - POST 请求的已解析 JSON body（server.ts 守卫链统一读取与校验；
+ * @param body - POST 请求的已解析 JSON body（server.ts 守卫链统一读取与校验；
  *   64 KiB 上限与 JSON 合法性属传输信封，在此前置，路由层直接消费）。
- *   D2.2 无已落地的 POST 路由，故暂不消费；D2.3 写路由起启用。
  */
 export async function handleEngramApi(
   req: IncomingMessage,
@@ -617,7 +894,7 @@ export async function handleEngramApi(
   route: string,
   url: URL,
   deps: WebApiDeps,
-  _body?: Record<string, unknown>,
+  body?: Record<string, unknown>,
 ): Promise<void> {
   const method = req.method ?? 'GET'
   const entry = ROUTES[route]
@@ -698,6 +975,28 @@ export async function handleEngramApi(
       case 'refurb':
         await handleRefurb(res, url, deps)
         return
+      // ---------- D2.3：写操作与导出 ----------
+      case 'update':
+        await handleUpdate(res, deps, body ?? {})
+        return
+      case 'forget':
+        await handleForget(res, deps, body ?? {})
+        return
+      case 'restore':
+        await handleRestore(res, deps, body ?? {})
+        return
+      case 'review-answer':
+        await handleReviewAnswer(res, deps, body ?? {})
+        return
+      case 'consolidate':
+        await handleConsolidate(res, deps, body ?? {})
+        return
+      case 'export':
+        await handleExport(res, url, deps)
+        return
+      case 'mirror':
+        await handleMirror(res, url, deps)
+        return
       default:
         json(res, 404, { error: 'unknown route' })
     }
@@ -714,6 +1013,10 @@ export async function handleEngramApi(
     }
     if (error instanceof ScopeNotSupportedError) {
       json(res, 501, { error: error.message })
+      return
+    }
+    if (error instanceof ConsolidationBusyError) {
+      json(res, 409, { error: error.message })
       return
     }
     if (error instanceof EngramError) {
