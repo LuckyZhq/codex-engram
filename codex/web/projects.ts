@@ -98,6 +98,22 @@ export interface ProjectRegistry {
   openStoreForRead(target: ProjectTarget): Promise<EngramStore | undefined>
 }
 
+/**
+ * 解析结果 → Runtime 写操作的定位参数（`CodexScopeTarget` 的项目定位部分）。
+ *
+ * 存在理由：Runtime 的写方法（`update`/`forget`/`restore`/`save`）只认
+ * `projectRoot` 或 `projectDbName`，WebAPI 的解析结果是 `ProjectTarget`
+ * （dbName + 可选 projectRoot）。经本函数转换后，写操作与读操作走**同一套**定位
+ * 判据，api.ts 不必自己判断该传哪个——选择器口径给 dbName、配置根口径给 projectRoot、
+ * user 作用域两者都不给。
+ */
+export function locatorOf(target: ProjectTarget): { projectRoot?: string; projectDbName?: string } {
+  if (target.scope === 'user') return {}
+  return target.projectRoot === undefined
+    ? { projectDbName: target.dbName }
+    : { projectRoot: target.projectRoot }
+}
+
 /** 路径末段（Windows/POSIX 分隔符都认）。 */
 function lastSegment(path: string): string {
   const normalized = path.replace(/[/\\]+$/, '')

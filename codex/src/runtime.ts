@@ -7,10 +7,12 @@
  * 数据库 schema、迁移机制、分库命名与作用域语义保持与 DSH 完全一致——同一份库文件
  * 两个宿主都能打开，不会产生格式分叉。
  *
- * 项目作用域有两种解析口径：
+ * 项目作用域有三种解析口径（互斥，同时给会 loud 拒绝）：
  * - 默认口径（`projectRoot` 缺省）：用配置里的 `cwd`——hook 链路拿得到会话 cwd，走这条。
  * - 显式口径（每次调用传 `projectRoot`）：MCP 进程的 cwd 是插件安装目录而非工作区，
  *   因此项目作用域必须逐调用解析（见 `codex/src/project-context.ts` 的可信来源与校验）。
+ * - 选择器口径（传 `projectDbName`）：WebAPI 只有面板给的 dbName，拿不到工作目录，
+ *   按已存在的库精确定位（复用 `openExistingProjectDb`，不建空库）。
  * @module codex-engram/runtime
  */
 
@@ -50,7 +52,7 @@ const USER_DB_NAME = 'user.db'
  */
 export const PROJECT_DB_NAME_PATTERN = /^project-[0-9a-f]{24}\.db$/
 
-/** 作用域目标：作用域 + 项目根（项目根的来源与校验由调用方负责）。 */
+/** 作用域目标：作用域 + 项目定位（项目根与项目库选择器二选一，来源与校验由调用方负责）。 */
 export interface CodexScopeTarget {
   /** 目标作用域；缺省 = 由方法自定（save/list 默认 project，get/forget/restore 自动定位）。 */
   readonly scope?: CodexScope
@@ -59,6 +61,14 @@ export interface CodexScopeTarget {
    * 同一仓库的不同 worktree 经 git origin 归一化后会落到同一个分库（原项目有意行为）。
    */
   readonly projectRoot?: string
+  /**
+   * 项目库文件名选择器（`project-<24位hex>.db`）——WebAPI 写操作的定位口径：
+   * 面板只有 dbName，拿不到工作目录。与 `projectRoot` **互斥**（同时给 = 定位有歧义，loud 拒绝）；
+   * 只按已存在的库精确定位（复用 `openExistingProjectDb`，不建空库、不接受路径拼装）。
+   *
+   * MCP/Hooks 不传此字段，行为与旧版完全一致。
+   */
+  readonly projectDbName?: string
 }
 
 /** 写入请求。 */
@@ -317,6 +327,42 @@ export async function openCodexRuntime(config: CodexEngramConfig = {}): Promise<
     return openDb(dbName)
   }
 
+  /** 项目库选择器是否指向已存在的库（只读判定，无副作用；读路径用它避免误建空库）。 */
+  const hasProjectDb = (dbName: string): boolean =>
+    PROJECT_DB_NAME_PATTERN.test(dbName) && existsSync(join(resolved.dbDir, dbName));
+
+  /** 定位口径互斥校验：同时给 projectRoot 与 projectDbName 说明调用方定位逻辑有歧义。 */
+  const checkLocator = (options: CodexScopeTarget): void => {
+    if (options.projectRoot !== undefined && options.projectDbName !== undefined) {
+      throw new EngramError('INVALID_SCOPE_TARGET', 'codex-engram: projectRoot 与 projectDbName 互斥，一次只能用一个口径定位项目库')
+    }
+    if (options.projectDbName !== undefined && options.scope === 'user') {
+      throw new EngramError('INVALID_SCOPE_TARGET', `codex-engram: user 作用域不接受项目库选择器（${options.projectDbName}）`)
+    }
+  }
+
+  /**
+   * 作用域目标 → 分库句柄（**写口径**：按需建库）。
+   * 给 `projectDbName` 时只定位已存在的库（不存在 loud 抛错，不建空库）；
+   * 其余走 `openScope`（projectRoot / 配置 cwd），与 MCP/Hooks 一致。
+   */
+  const openTargetForWrite = async (scope: CodexScope, options: CodexScopeTarget): Promise<EngramStore> => {
+    checkLocator(options)
+    return options.projectDbName === undefined
+      ? openScope(scope, options.projectRoot)
+      : openExistingProjectDb(options.projectDbName)
+  }
+
+  /**
+   * 作用域目标 → 分库句柄（**读口径**：库不存在返回 undefined，不建空库）。
+   * 与 `openTargetForWrite` 同一套定位规则，区别只在缺库时的处理。
+   */
+  const openTargetForRead = async (scope: CodexScope, options: CodexScopeTarget): Promise<EngramStore | undefined> => {
+    checkLocator(options)
+    if (options.projectDbName === undefined) return readScope(scope, options.projectRoot)
+    return hasProjectDb(options.projectDbName) ? openExistingProjectDb(options.projectDbName) : undefined
+  }
+
   /** 只读口径：库文件不存在时返回 undefined——查询不给一次性 cwd 建空库。 */
   const readScope = async (scope: CodexScope, projectRoot?: string): Promise<EngramStore | undefined> =>
     scopeExists(scope, projectRoot) ? openScope(scope, projectRoot) : undefined
@@ -359,12 +405,17 @@ export async function openCodexRuntime(config: CodexEngramConfig = {}): Promise<
     return undefined
   }
 
-  /** 定位并要求存在（写入/修正/删除路径用）；显式作用域下 id 不在该库时 loud 失败。 */
+  /**
+   * 定位并要求存在（修正/遗忘/恢复路径用）：给显式定位（作用域或项目库选择器）时
+   * **只在该库内找**——面板选定项目后，别的库里同 id 的条目不会被代劳恢复/删除。
+   */
   const requireStore = async (id: string, options: CodexScopeTarget): Promise<EngramStore> => {
-    if (options.scope !== undefined) {
-      const store = await readScope(options.scope, options.projectRoot)
+    if (options.scope !== undefined || options.projectDbName !== undefined) {
+      const scope = options.scope ?? 'project'
+      const store = await openTargetForRead(scope, options)
       if (store !== undefined && await store.get(asMemoryId(id)) !== undefined) return store
-      throw new EngramError('NOT_FOUND', `codex-engram: 条目 ${id} 不存在于 ${options.scope} 库（用 engram_list/engram_search 确认 id 与 scope）`)
+      const where = options.projectDbName === undefined ? `${scope} 库` : options.projectDbName
+      throw new EngramError('NOT_FOUND', `codex-engram: 条目 ${id} 不存在于 ${where}（用 engram_list/engram_search 确认 id 与 scope）`)
     }
     const found = await locate(id, options)
     if (found === undefined) {
@@ -385,7 +436,7 @@ export async function openCodexRuntime(config: CodexEngramConfig = {}): Promise<
   const save = async (input: CodexSaveInput): Promise<CodexSaveResult> => {
     const content = cleanContent(input.content, 'engram_save')
     const scope = input.scope ?? 'project'
-    const store = await openScope(scope, input.projectRoot)
+    const store = await openTargetForWrite(scope, input)
     const vectors = await embedTexts([content.trim()])
     const embedding = vectors?.[0]
     const degraded = embedding === undefined
@@ -429,7 +480,7 @@ export async function openCodexRuntime(config: CodexEngramConfig = {}): Promise<
     const vectors = await embedTexts([input.query])
     const vector = vectors?.[0]
     const perScope = await Promise.all(scopes.map(async (scope) => {
-      const store = await readScope(scope, input.projectRoot)
+      const store = await openTargetForRead(scope, input)
       if (store === undefined) return undefined
       return store.search({
         text: input.query,
@@ -461,15 +512,15 @@ export async function openCodexRuntime(config: CodexEngramConfig = {}): Promise<
     save,
     search,
     async get(id, options = {}) {
-      if (options.scope !== undefined) {
-        const store = await readScope(options.scope, options.projectRoot)
+      if (options.scope !== undefined || options.projectDbName !== undefined) {
+        const store = await openTargetForRead(options.scope ?? 'project', options)
         return store === undefined ? undefined : store.get(asMemoryId(id))
       }
       return (await locate(id, options))?.record
     },
     async list(input) {
       const scope = input.scope ?? 'project'
-      const store = await readScope(scope, input.projectRoot)
+      const store = await openTargetForRead(scope, input)
       if (store === undefined) return { records: [], total: 0 }
       return store.list({
         scope,
