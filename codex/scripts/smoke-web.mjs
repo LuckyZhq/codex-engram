@@ -203,8 +203,8 @@ check('路径穿越选择器 400', traversal.status === 400)
 
 // ---------- ⑦ 路由状态 ----------
 title('⑦ 路由状态')
-// D2.2 已实装 16 个查询路由；501 探测改用 D2.3 的 export（写操作与导出阶段）。
-const pending = await fetch(`${base}/api/engram/export`, { headers: { authorization: `Bearer ${TOKEN}` } })
+// D2.2 实装 16 个查询路由、D2.3 实装 7 个写/导出路由；501 探测改用 D3 的 models。
+const pending = await fetch(`${base}/api/engram/models`, { headers: { authorization: `Bearer ${TOKEN}` } })
 check('未落地路由 501（不假成功）', pending.status === 501)
 const noRoute = await fetch(`${base}/api/engram/no-such-route`, { headers: { authorization: `Bearer ${TOKEN}` } })
 check('未知路由 404', noRoute.status === 404)
@@ -276,6 +276,71 @@ check('refurb：小库早退（无建议）', refurb.body?.count === 0 && Array.
 
 const sharedTelemetry = await query('telemetry?days=7&scope=shared')
 check('telemetry：shared 作用域显式 501（不触发不存在的库）', sharedTelemetry.status === 501)
+
+// ---------- ⑦c D2.3 写操作与导出（真实写入 + 真实文件） ----------
+title('⑦c D2.3 写操作与导出')
+const post = async (route, payload) => {
+  const res = await fetch(`${base}/api/engram/${route}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  return { status: res.status, body: await res.json() }
+}
+
+// update：新条目 active、旧条目归档、取代链保留
+const updated = await post('update', {
+  id: recordId, scope: 'project', project: dbName, content: '修正：提交前跑 pnpm typecheck 与 vitest',
+})
+check('update 200 且带回取代关系', updated.status === 200 && updated.body.record?.id !== recordId && updated.body.superseded === recordId, JSON.stringify(updated.body.error ?? ''))
+const newId = updated.body.record?.id ?? ''
+const reviewNew = await query(`review?scope=project&project=${encodeURIComponent(dbName)}&id=${encodeURIComponent(newId)}`)
+check('新条目 active 且审计视图可回查', reviewNew.body?.record?.status === 'active')
+
+// review-answer：SM-2 自评
+const answered = await post('review-answer', { id: newId, scope: 'project', project: dbName, grade: 4 })
+check('review-answer：调度落库（reps=1 + 下次到期）',
+  answered.status === 200 && answered.body.review?.reps === 1 && typeof answered.body.review?.nextReviewAt === 'number',
+  JSON.stringify(answered.body.error ?? ''))
+const badGrade = await post('review-answer', { id: newId, scope: 'project', project: dbName, grade: 9 })
+check('review-answer：grade 越界 400', badGrade.status === 400)
+
+// forget（墓志铭）→ restore
+const forgot = await post('forget', {
+  id: newId, scope: 'project', project: dbName, reason: '冒烟清理', affects: '无', stillUseful: '可恢复',
+})
+check('forget（三问齐全）软删成功', forgot.status === 200 && forgot.body.record?.status === 'forgotten')
+const halfTomb = await post('forget', { id: newId, scope: 'project', project: dbName, reason: '只填一问' })
+check('forget：墓志铭半填 400', halfTomb.status === 400)
+const restored = await post('restore', { id: newId, scope: 'project', project: dbName })
+check('restore：恢复为 active', restored.status === 200 && restored.body.record?.status === 'active')
+
+// consolidate：两种模式必须显式二选一
+const noMode = await post('consolidate', { scope: 'project', project: dbName })
+check('consolidate：未指定模式 400（不静默全库整理）', noMode.status === 400)
+
+// 写入边界：shared 501、未知项目 404
+const sharedWrite = await post('forget', { id: newId, scope: 'shared' })
+check('写操作 shared 501（不误写 user 库）', sharedWrite.status === 501)
+const unknownWrite = await post('forget', { id: newId, scope: 'project', project: `project-${'f'.repeat(24)}.db` })
+check('写操作未知项目 404 unknown project', unknownWrite.status === 404 && unknownWrite.body.error === 'unknown project')
+
+// export：markdown / json
+const mdRes = await fetch(`${base}/api/engram/export?scope=project&project=${encodeURIComponent(dbName)}&format=markdown`, { headers: auth })
+const mdText = await mdRes.text()
+check('export markdown：正文含记忆且带关系边小节',
+  mdRes.status === 200 && mdText.includes('pnpm typecheck') && mdText.includes('## 关系边'))
+const jsonRes = await (await fetch(`${base}/api/engram/export?scope=project&project=${encodeURIComponent(dbName)}&format=json`, { headers: auth })).json()
+check('export json：records 可解析且含归档条目', Array.isArray(jsonRes.records) && jsonRes.records.length >= 2)
+
+// mirror：隔离目录 + 真实文件树（不改写 SQLite）
+const mirror = await (await fetch(`${base}/api/engram/mirror?scope=project&project=${encodeURIComponent(dbName)}`, { headers: auth })).json()
+check('mirror：报告含隔离目录（palaces/<scope>/<库>/<批次>）',
+  typeof mirror.rootDir === 'string' && mirror.rootDir.includes(join('palaces', 'project')) && mirror.fileCount >= 3,
+  JSON.stringify(mirror.error ?? ''))
+check('mirror：_index.md 与 _meta.json 已落盘',
+  existsSync(join(mirror.rootDir ?? '', '_index.md')) && existsSync(join(mirror.rootDir ?? '', '_meta.json')))
+check('mirror：不改写 SQLite（条数与导出一致）', mirror.memoryCount === jsonRes.records.length)
 
 // ---------- ⑧ 静态 UI ----------
 title('⑧ 静态 UI 分发')

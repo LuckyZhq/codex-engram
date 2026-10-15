@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -8,6 +8,7 @@ import { request as httpRequest } from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { openCodexRuntime } from '../codex/src/runtime.ts'
 import type { CodexRuntime } from '../codex/src/runtime.ts'
+import type { EngramStore } from '../src/store/interface.ts'
 import { createWebServer } from '../codex/web/server.ts'
 import type { WebServer } from '../codex/web/server.ts'
 import { handleEngramApi } from '../codex/web/api.ts'
@@ -345,8 +346,8 @@ describe('codex/web — 路由状态与静态分发', () => {
     const dbDir = await tempDir('codex-web-route-')
     const { base } = await startServer({ dbDir })
 
-    // D2.2 已实装 telemetry 等 16 个查询路由；501 探测改用 D2.3 的 export（写操作与导出阶段）。
-    const pending = await fetch(`${base}/api/engram/export`, { headers: bearer() })
+    // D2.2 实装 16 个查询路由、D2.3 实装 7 个写/导出路由；501 探测改用 D3 的 models。
+    const pending = await fetch(`${base}/api/engram/models`, { headers: bearer() })
     expect(pending.status).toBe(501)
     expect((await pending.json()).error).toContain('not implemented yet')
 
@@ -889,5 +890,403 @@ describe('codex/web — D2.2 核心查询（真实 SQLite，无 Mock）', () => 
     } finally {
       logged.mockRestore()
     }
+  })
+})
+
+// ---------- D2.3：写操作与导出 ----------
+
+/** POST JSON（默认带 Bearer）→ 状态码 + 解析后的 JSON（非 JSON 时 json 为 null，保留原文）。 */
+async function postJson(
+  base: string,
+  route: string,
+  payload: Record<string, unknown>,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; json: Record<string, unknown> | null; text: string }> {
+  const res = await fetch(`${base}/api/engram/${route}`, {
+    method: 'POST',
+    headers: { ...bearer(), ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  const text = await res.text()
+  let parsed: Record<string, unknown> | null = null
+  try { parsed = JSON.parse(text) as Record<string, unknown> } catch { /* 非 JSON 响应 */ }
+  return { status: res.status, json: parsed, text }
+}
+
+/** GET（默认带 Bearer）→ 状态码 + 原文 + 解析后的 JSON（非 JSON 时为 null）。 */
+async function getRaw(
+  base: string,
+  path: string,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; text: string; json: Record<string, unknown> | null; contentType: string | null }> {
+  const res = await fetch(`${base}/api/engram/${path}`, { headers: { ...bearer(), ...headers } })
+  const text = await res.text()
+  let parsed: Record<string, unknown> | null = null
+  try { parsed = JSON.parse(text) as Record<string, unknown> } catch { /* 导出类非 JSON */ }
+  return { status: res.status, text, json: parsed, contentType: res.headers.get('content-type') }
+}
+
+/** 桩响应：捕获 writeHead 状态码与响应体（直接调 handleEngramApi 的单元路径用）。 */
+function stubRes(): { res: ServerResponse; sent: { status: number; body: string } } {
+  const sent = { status: 0, body: '' }
+  const res = {
+    writeHead: (status: number) => { sent.status = status },
+    end: (body?: string) => { sent.body = body ?? '' },
+  } as unknown as ServerResponse
+  return { res, sent }
+}
+
+describe('codex/web — D2.3-A 记忆编辑、遗忘与恢复', () => {
+  it('update：新条目 active、旧条目归档、supersedes 链保留；正文经脱敏', async () => {
+    const dbDir = await tempDir('codex-web-d23-')
+    const repoA = await makeRepo('git@github.com:acme/w-alpha.git')
+    const { runtime, base } = await startServer({ dbDir })
+    await runtime.save({ content: '原始约定：提交前跑测试', kind: 'decision', projectRoot: repoA })
+    const dbA = runtime.scopeDbName('project', repoA)
+
+    const listed = (await (await getRaw(base, `list?scope=project&project=${dbA}`)).json)!
+    const oldId = (listed['records'] as { id: string }[])[0]!.id
+
+    const updated = await postJson(base, 'update', {
+      id: oldId,
+      scope: 'project',
+      project: dbA,
+      content: '新约定：提交前跑 pnpm typecheck（附带 sk-abcdefghijklmnopqrstuvwxyz0123456789abcdefghij）',
+      kind: 'fact',
+      importance: 0.9,
+    })
+    expect(updated.status).toBe(200)
+    const record = updated.json!['record'] as {
+      id: string; content: string; status: string; kind: string; importance: number
+    }
+    expect(record.id).not.toBe(oldId)
+    expect(record.status).toBe('active')
+    expect(record.kind).toBe('fact')
+    expect(record.importance).toBeCloseTo(0.9, 5)
+    // 脱敏走 Runtime 同一防线（不复制第二套规则）
+    expect(record.content).toContain('[REDACTED:')
+    expect(record.content).not.toContain('sk-abcdefghij')
+    expect(updated.json!['superseded']).toBe(oldId)
+
+    // 旧条目归档（可审计：review 审计路由仍查得到，不是消失）
+    const old = await runtime.get(oldId, { scope: 'project', projectRoot: repoA })
+    expect(old?.status).toBe('archived')
+    const auditOld = await getRaw(base, `review?scope=project&project=${dbA}&id=${oldId}`)
+    expect(auditOld.status).toBe(200)
+    expect((auditOld.json!['record'] as { status: string }).status).toBe('archived')
+
+    // MCP 侧（另一入口，同一份库）能检索到更新后的 active 条目
+    const hits = await runtime.search({ query: 'pnpm typecheck', scopes: ['project'], projectRoot: repoA })
+    expect(hits.hits.some(hit => String(hit.record.id) === record.id)).toBe(true)
+
+    const store = await runtime.openScope('project', repoA)
+    const data = await store.exportAll()
+    expect(data.edges.map(edge => `${String(edge.from)}→${String(edge.to)}:${edge.type}`))
+      .toContain(`${record.id}→${oldId}:supersedes`)
+
+    // 校验：content 缺失 400、kind 非法 400、importance 越界 400（失败不落任何部分结果）
+    expect((await postJson(base, 'update', { id: oldId, scope: 'project', project: dbA })).status).toBe(400)
+    const badKind = await postJson(base, 'update', { id: oldId, scope: 'project', project: dbA, content: 'x', kind: 'nope' })
+    expect(badKind.status).toBe(400)
+    const badImportance = await postJson(base, 'update', {
+      id: oldId, scope: 'project', project: dbA, content: 'x', importance: 1.5,
+    })
+    expect(badImportance.status).toBe(400)
+    const after = await store.stats()
+    expect(after.total).toBe(2)
+  })
+
+  it('写操作定位：缺失项目上下文 404、非法选择器 400、未知项目 404、shared 501', async () => {
+    const dbDir = await tempDir('codex-web-d23-')
+    const repoA = await makeRepo('git@github.com:acme/w-beta.git')
+    const { runtime, base } = await startServer({ dbDir })
+    await runtime.save({ content: 'Beta 库记忆', kind: 'fact', projectRoot: repoA })
+    const dbA = runtime.scopeDbName('project', repoA)
+    const id = (await (await getRaw(base, `list?scope=project&project=${dbA}`)).json!)['records'] as { id: string }[]
+    const recordId = id[0]!.id
+
+    // 无默认项目根 + 无选择器 → 明确拒绝（绝不回落进程 cwd）
+    const noContext = await postJson(base, 'forget', { id: recordId, scope: 'project' })
+    expect(noContext.status).toBe(404)
+    expect(noContext.json?.['error']).toBe('unknown project')
+
+    const invalid = await postJson(base, 'forget', { id: recordId, scope: 'project', project: '../../etc/passwd' })
+    expect(invalid.status).toBe(400)
+
+    const unknown = await postJson(base, 'forget', { id: recordId, scope: 'project', project: `project-${'f'.repeat(24)}.db` })
+    expect(unknown.status).toBe(404)
+    expect(unknown.json?.['error']).toBe('unknown project')
+
+    // shared 一律 501，且不误写 user 库
+    const shared = await postJson(base, 'forget', { id: recordId, scope: 'shared' })
+    expect(shared.status).toBe(501)
+    expect(shared.json?.['error']).toContain('shared')
+
+    // 未认证写操作：401 且库无变化
+    const anon = await fetch(`${base}/api/engram/forget`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: recordId, scope: 'project', project: dbA }),
+    })
+    expect(anon.status).toBe(401)
+    const still = await runtime.get(recordId, { scope: 'project', projectRoot: repoA })
+    expect(still?.status).toBe('active')
+  })
+
+  it('forget → restore 闭环；墓志铭三问要么都填要么都不填', async () => {
+    const dbDir = await tempDir('codex-web-d23-')
+    const repoA = await makeRepo('git@github.com:acme/w-gamma.git')
+    const { runtime, base } = await startServer({ dbDir })
+    await runtime.save({ content: '待遗忘的约定甲', kind: 'decision', projectRoot: repoA })
+    await runtime.save({ content: '待遗忘的约定乙', kind: 'decision', projectRoot: repoA })
+    const dbA = runtime.scopeDbName('project', repoA)
+    const records = (await (await getRaw(base, `list?scope=project&project=${dbA}`)).json!)['records'] as { id: string; content: string }[]
+    const plain = records.find(row => row.content === '待遗忘的约定甲')!
+    const withTomb = records.find(row => row.content === '待遗忘的约定乙')!
+
+    // 普通遗忘（软删，可恢复）
+    const forgot = await postJson(base, 'forget', { id: plain.id, scope: 'project', project: dbA })
+    expect(forgot.status).toBe(200)
+    expect((forgot.json!['record'] as { status: string }).status).toBe('forgotten')
+
+    // 墓志铭半填 → 400，且条目不动
+    const partial = await postJson(base, 'forget', { id: withTomb.id, scope: 'project', project: dbA, reason: '被取代' })
+    expect(partial.status).toBe(400)
+    expect((await runtime.get(withTomb.id, { scope: 'project', projectRoot: repoA }))?.status).toBe('active')
+
+    // 三问齐全 → 落审计（listForgottenWithTombs 能读回）
+    const tombstoned = await postJson(base, 'forget', {
+      id: withTomb.id, scope: 'project', project: dbA,
+      reason: '被新约定取代', affects: '提交流程', stillUseful: '可考古',
+    })
+    expect(tombstoned.status).toBe(200)
+    const store = await runtime.openScope('project', repoA)
+    const tombs = await store.listForgottenWithTombs(10)
+    const row = tombs.find(item => String(item.id) === withTomb.id)
+    expect(row?.tombstone).toEqual({ reason: '被新约定取代', affects: '提交流程', stillUseful: '可考古' })
+
+    // 恢复：两条都回 active
+    for (const target of [plain.id, withTomb.id]) {
+      const restored = await postJson(base, 'restore', { id: target, scope: 'project', project: dbA })
+      expect(restored.status).toBe(200)
+      expect((restored.json!['record'] as { status: string }).status).toBe('active')
+    }
+    // 跨库不代劳：用另一个库的选择器恢复 → 404
+    const repoB = await makeRepo('git@github.com:acme/w-delta.git')
+    await runtime.save({ content: '另一库', kind: 'fact', projectRoot: repoB })
+    const dbB = runtime.scopeDbName('project', repoB)
+    const cross = await postJson(base, 'restore', { id: plain.id, scope: 'project', project: dbB })
+    expect(cross.status).toBe(404)
+  })
+})
+
+describe('codex/web — D2.3-B 复习调度与闭馆整理', () => {
+  it('review-answer：grade 0-5 校验；SM-2 调度落库且重启后可读', async () => {
+    const dbDir = await tempDir('codex-web-d23-')
+    const repoA = await makeRepo('git@github.com:acme/w-review.git')
+    const first = await startServer({ dbDir })
+    await first.runtime.save({ content: '待复习的约定', kind: 'fact', projectRoot: repoA })
+    const dbA = first.runtime.scopeDbName('project', repoA)
+    const recordId = (await (await getRaw(first.base, `list?scope=project&project=${dbA}`)).json!)['records'] as { id: string }[]
+
+    const badGrade = await postJson(first.base, 'review-answer', { id: recordId[0]!.id, scope: 'project', project: dbA, grade: 9 })
+    expect(badGrade.status).toBe(400)
+    const floatGrade = await postJson(first.base, 'review-answer', { id: recordId[0]!.id, scope: 'project', project: dbA, grade: 2.5 })
+    expect(floatGrade.status).toBe(400)
+    const noId = await postJson(first.base, 'review-answer', { scope: 'project', project: dbA, grade: 5 })
+    expect(noId.status).toBe(400)
+
+    const answered = await postJson(first.base, 'review-answer', {
+      id: recordId[0]!.id, scope: 'project', project: dbA, grade: 5,
+    })
+    expect(answered.status).toBe(200)
+    const review = answered.json!['review'] as { reps: number; easeFactor: number; intervalDays: number; nextReviewAt: number | null }
+    expect(review.reps).toBe(1)
+    expect(review.easeFactor).toBeGreaterThan(2.5 - 1e-6)
+    expect(review.intervalDays).toBeGreaterThanOrEqual(1)
+    expect(review.nextReviewAt).toBeGreaterThan(Date.now())
+
+    // 未知 id → 404（不为一个失败的排期建库/建条目）
+    const missing = await postJson(first.base, 'review-answer', { id: 'nosuchid', scope: 'project', project: dbA, grade: 5 })
+    expect(missing.status).toBe(404)
+
+    // 重启后调度仍在（持久化，不是进程内状态）
+    await first.server.close()
+    const second = await startServer({ dbDir })
+    const persisted = await second.runtime.get(recordId[0]!.id, { scope: 'project', projectRoot: repoA })
+    expect(persisted?.review?.reps).toBe(1)
+    expect(persisted?.review?.nextReviewAt).toBe(review.nextReviewAt)
+  })
+
+  it('consolidate：两种模式必须显式二选一；candidates/full 互斥', async () => {
+    const dbDir = await tempDir('codex-web-d23-')
+    const repoA = await makeRepo('git@github.com:acme/w-cons.git')
+    const { runtime, base } = await startServer({ dbDir })
+    await runtime.save({ content: '整理候选甲', kind: 'fact', projectRoot: repoA })
+    const dbA = runtime.scopeDbName('project', repoA)
+    const ids = ((await (await getRaw(base, `list?scope=project&project=${dbA}`)).json!)['records'] as { id: string }[])
+      .map(row => row.id)
+
+    const neither = await postJson(base, 'consolidate', { scope: 'project', project: dbA })
+    expect(neither.status).toBe(400)
+    const both = await postJson(base, 'consolidate', { scope: 'project', project: dbA, candidates: ids, full: true })
+    expect(both.status).toBe(400)
+    const crossDb = await postJson(base, 'consolidate', { scope: 'project', project: dbA, candidates: ['nosuchid'] })
+    expect(crossDb.status).toBe(404)
+    expect(String(crossDb.json?.['error'])).toContain('不在目标库')
+  })
+
+  it('consolidate 局部合并：不归档全库；未选中的条目不受影响', async () => {
+    const dbDir = await tempDir('codex-web-d23-')
+    const repoA = await makeRepo('git@github.com:acme/w-cons2.git')
+    const { runtime, base } = await startServer({ dbDir })
+    // 两条相同正文（候选）+ 一条「该被全库整理归档」的低重要性老旧条目
+    await runtime.save({ content: '重复的部署流程', kind: 'fact', importance: 0.5, projectRoot: repoA })
+    await runtime.save({ content: '重复的部署流程', kind: 'fact', importance: 0.5, projectRoot: repoA })
+    const victim = (await runtime.save({ content: '过期的临时约定', kind: 'fact', importance: 0.1, projectRoot: repoA })).record
+    const dbA = runtime.scopeDbName('project', repoA)
+    const store = await runtime.openScope('project', repoA)
+    // 把 victim 造老 + 降置信（接口不暴露这两个字段，直接改库，与 tests/consolidation.spec.ts 同法）
+    const { DatabaseSync } = await import('node:sqlite')
+    const raw = new DatabaseSync(join(dbDir, dbA))
+    raw.prepare('UPDATE nodes SET created_at = ?, confidence = 0.1 WHERE id = ?')
+      .run(Date.now() - 60 * 86_400_000, victim.id)
+    raw.close()
+
+    const rows = ((await (await getRaw(base, `list?scope=project&project=${dbA}`)).json!)['records'] as { id: string; content: string }[])
+    const candidates = rows.filter(row => row.content === '重复的部署流程').map(row => row.id)
+    expect(candidates).toHaveLength(2)
+
+    // 局部合并：归档阶段整段跳过 → 未选中的 victim 仍是 active
+    const partial = await postJson(base, 'consolidate', { scope: 'project', project: dbA, candidates })
+    expect(partial.status).toBe(200)
+    expect(partial.json!['mode']).toBe('partial')
+    expect(partial.json!['archived']).toBe(0)
+    expect((await store.get(victim.id))?.status).toBe('active')
+
+    // 全库整理：归档阶段扫全库 → victim 被归档（证明上面的「不受影响」不是因为阈值没命中）
+    const full = await postJson(base, 'consolidate', { scope: 'project', project: dbA, full: true })
+    expect(full.status).toBe(200)
+    expect(full.json!['archived']).toBe(1)
+    expect((await store.get(victim.id))?.status).toBe('forgotten')
+  })
+
+  it('同一分库并发整理 → 409；执行标记由 try/finally 释放', async () => {
+    const dbDir = await tempDir('codex-web-d23-')
+    const runtime = await openCodexRuntime({ dbDir, embedding: 'off' })
+    runtimes.push(runtime)
+    const registry = createProjectRegistry({ runtime })
+
+    /** 慢速 topActive：第一次调用挂起，直到 release 被调用（制造稳定的并发窗口）。 */
+    let release = (): void => {}
+    const hanging = new Promise<never[]>(resolvePromise => { release = () => { resolvePromise([]) } })
+    const slowStore = {
+      stats: async () => ({ total: 0, active: 0, archived: 0, forgotten: 0, redacted: 0, edges: 0, signalRatio: 0 }),
+      topActive: async () => hanging,
+      audit: async () => { /* noop */ },
+    } as unknown as EngramStore
+    const deps = {
+      runtime,
+      projects: { ...registry, openStoreForRead: async () => slowStore } as unknown as ProjectRegistry,
+    }
+
+    const req = { method: 'POST' } as unknown as IncomingMessage
+    const url = new URL('http://127.0.0.1/api/engram/consolidate')
+    const firstRes = stubRes()
+    const secondRes = stubRes()
+    // 第一个请求进入整理（挂在 topActive 上），第二个同库请求必须 409
+    const pending = handleEngramApi(req, firstRes.res, 'consolidate', url, deps, { scope: 'user', full: true })
+    await handleEngramApi(req, secondRes.res, 'consolidate', url, deps, { scope: 'user', full: true })
+    expect(secondRes.sent.status).toBe(409)
+    expect(secondRes.sent.body).toContain('已有整理任务')
+
+    release()
+    await pending
+    expect(firstRes.sent.status).toBe(200)
+    // 标记已释放：同样的请求可以再次执行（不会永久占用）
+    const thirdRes = stubRes()
+    await handleEngramApi(req, thirdRes.res, 'consolidate', url, deps, { scope: 'user', full: true })
+    expect(thirdRes.sent.status).toBe(200)
+  })
+})
+
+describe('codex/web — D2.3-C 真实导出与镜像', () => {
+  it('export：markdown / json 内容来自真实库；空库给合法空结构', async () => {
+    const dbDir = await tempDir('codex-web-d23-')
+    const repoA = await makeRepo('git@github.com:acme/w-export.git')
+    const { runtime, base } = await startServer({ dbDir })
+    await runtime.save({ content: '导出目标记忆', kind: 'decision', projectRoot: repoA })
+    const dbA = runtime.scopeDbName('project', repoA)
+
+    const md = await getRaw(base, `export?scope=project&project=${dbA}&format=markdown`)
+    expect(md.status).toBe(200)
+    expect(md.contentType).toContain('text/markdown')
+    expect(md.text).toContain('导出目标记忆')
+    expect(md.text).toContain('## 关系边')
+
+    const json = await getRaw(base, `export?scope=project&project=${dbA}&format=json`)
+    expect(json.status).toBe(200)
+    expect(json.contentType).toContain('application/json')
+    expect((json.json!['records'] as { content: string }[]).map(row => row.content)).toContain('导出目标记忆')
+    expect(Array.isArray(json.json!['edges'])).toBe(true)
+
+    // 空库（user 库不存在）→ 合法空结构，不建库
+    const empty = await getRaw(base, 'export?scope=user&format=json')
+    expect(empty.status).toBe(200)
+    expect((empty.json!['records'] as unknown[]).length).toBe(0)
+    expect(existsSync(join(dbDir, 'user.db'))).toBe(false)
+
+    // 导出选择器边界与查询路由同口径
+    expect((await getRaw(base, `export?scope=project&project=${encodeURIComponent('../../etc/passwd')}`)).status).toBe(400)
+    expect((await getRaw(base, `export?scope=project&project=project-${'f'.repeat(24)}.db`)).status).toBe(404)
+  })
+
+  it('mirror：分房间文件树落在隔离目录；跨项目、跨批次互不覆盖', async () => {
+    const dbDir = await tempDir('codex-web-d23-')
+    const repoA = await makeRepo('git@github.com:acme/w-mirror-a.git')
+    const repoB = await makeRepo('git@github.com:acme/w-mirror-b.git')
+    const { runtime, base } = await startServer({ dbDir })
+    await runtime.save({ content: '甲库的事实', kind: 'fact', projectRoot: repoA })
+    await runtime.save({ content: '甲库的决策', kind: 'decision', projectRoot: repoA })
+    await runtime.save({ content: '乙库的事实', kind: 'fact', projectRoot: repoB })
+    const dbA = runtime.scopeDbName('project', repoA)
+    const dbB = runtime.scopeDbName('project', repoB)
+
+    const first = (await getRaw(base, `mirror?scope=project&project=${dbA}`)).json!
+    expect(first['scope']).toBe('project')
+    expect(first['memoryCount']).toBe(2)
+    expect(first['fileCount']).toBeGreaterThanOrEqual(3) // 2 条记忆 + _index.md + _meta.json
+    const rootDir = String(first['rootDir'])
+    expect(rootDir).toContain(join('palaces', 'project', dbA.replace(/\.db$/, '')))
+    const exportId = String(first['exportId'])
+    expect(exportId).not.toBe('')
+
+    // 文件树：按 kind 分房间 + 顶层入口
+    const rooms = await readdir(rootDir)
+    expect(rooms).toContain('fact')
+    expect(rooms).toContain('decision')
+    expect(rooms).toContain('_index.md')
+    expect(rooms).toContain('_meta.json')
+    const index = await readFile(join(rootDir, '_index.md'), 'utf8')
+    expect(index).toContain('甲库的事实')
+    expect(index).not.toContain('乙库的事实')
+
+    // 乙库导出：独立目录，文件不串
+    const second = (await getRaw(base, `mirror?scope=project&project=${dbB}`)).json!
+    expect(String(second['rootDir'])).not.toBe(rootDir)
+    expect(String(second['rootDir'])).toContain(dbB.replace(/\.db$/, ''))
+    const secondIndex = await readFile(join(String(second['rootDir']), '_index.md'), 'utf8')
+    expect(secondIndex).toContain('乙库的事实')
+    expect(secondIndex).not.toContain('甲库的事实')
+
+    // 同库再次导出：新批次目录（不覆盖上一次）
+    const again = (await getRaw(base, `mirror?scope=project&project=${dbA}`)).json!
+    expect(String(again['rootDir'])).not.toBe(rootDir)
+    expect(String(again['exportId'])).not.toBe(exportId)
+    expect(existsSync(rootDir)).toBe(true)
+
+    // 镜像不写 SQLite：记忆条数与内容不变
+    const listed = (await getRaw(base, `list?scope=project&project=${dbA}`)).json!
+    expect((listed['records'] as unknown[]).length).toBe(2)
   })
 })

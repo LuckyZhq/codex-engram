@@ -135,6 +135,8 @@ export type EngramKey =
   | 'batchForget'
   | 'batchForgetConfirm'
   | 'batchRestore'
+  | 'batchDone'
+  | 'batchPartialFailed'
   | 'clearSelection'
   | 'sectionCorridor'
   | 'corridorEmpty'
@@ -469,6 +471,8 @@ export const zh: Record<EngramKey, string> = {
   batchForget: '批量封门（{n}）',
   batchForgetConfirm: '确认封门 {n} 条？',
   batchRestore: '批量重开（{n}）',
+  batchDone: '已处理 {n} 条',
+  batchPartialFailed: '{total} 条中 {n} 条失败（其余已处理）：{msg}',
   clearSelection: '清空所选',
   sectionCorridor: '走廊鸟瞰',
   corridorEmpty: '走廊空空如也，落成几条记忆后这里会出现鸟瞰图。',
@@ -795,6 +799,8 @@ export const en: Record<EngramKey, string> = {
   batchForget: 'Close selected ({n})',
   batchForgetConfirm: 'Close {n} memories?',
   batchRestore: 'Reopen selected ({n})',
+  batchDone: 'Handled {n}',
+  batchPartialFailed: '{n} of {total} failed (rest handled): {msg}',
   clearSelection: 'Clear selection',
   sectionCorridor: 'Corridor overview',
   corridorEmpty: 'No memories yet — the bird’s-eye view appears after a few memories arrive.',

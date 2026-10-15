@@ -139,11 +139,72 @@ tour-proposal、refurb、profile-block、activity。DTO 以 `src/routes.ts` 实�
   扩展、实体详情 + 事实版本链（生效/已失效）、信念 + 证据链回溯、活动日志、
   私人/项目作用域隔离（不串库）、全页面无 4xx/5xx——**30/30 通过**。
 
-### D2.3 — 写操作、导出、功能边界（待实施）
+### D2.3 — 写操作、导出、功能边界（2026-10-15 落地）
 
-update/forget/restore/review-answer/consolidate + 真实文件导出（mirror 是 GET 但会创建
-导出目录：保留面板兼容路径 + 认证 + 输出目录限制，后续再议改 POST）。
-shared/历史回填/Jev 保持明确不可用。
+**接口契约**（与 DSH `src/routes.ts` 实际可达分支一致，面板零改动）：
+
+| 接口 | 请求 | 成功响应 | 说明 |
+|---|---|---|---|
+| `POST update` | `id, scope, project?, content, kind?, importance?` | `{ record, superseded }` | 取代式修改：新条目 active、旧条目归档、建 supersedes 边 |
+| `POST forget` | `id, scope, project?`；可选 `reason/affects/stillUseful` | `{ record }` | 软删；三问齐全走 `forgetWithTombstone`（审计），全不给走普通 forget，**半填 400** |
+| `POST restore` | `id, scope, project?` | `{ record }` | 恢复 archived/forgotten |
+| `POST review-answer` | `id, scope, project?, grade(0-5 整数)` | `{ id, review }` | 直接调 `store.scheduleReview`，不复制 SM-2 公式 |
+| `POST consolidate` | `scope, project?, candidates[]` 或 `full:true` | `{ archived, merged, skipped, tookMs, scope, mode }` | 两种模式互斥且必须显式二选一 |
+| `GET export` | `scope, project?, format=markdown\|json` | 附件下载 | 只读数据库，不落盘 |
+| `GET mirror` | `scope, project?` | 生成报告 JSON | 写服务端文件树（保留面板 `<a href>` 直链契约） |
+
+**关键决策**：
+
+1. **写操作走 Runtime，不复制业务逻辑。** 给 `CodexScopeTarget` 增加
+   `projectDbName`（与 `projectRoot` **互斥**，同时给 loud 拒绝），Runtime 内部新增
+   `openTargetForWrite/openTargetForRead` 统一三种定位口径；`update/forget/restore/
+   save/list/search/get` 全部走这套判据。这样 WebAPI 不必复制 Runtime 的脱敏、
+   向量重算、取代链与墓志铭校验（复制就会漂移）。WebAPI 侧用 `projects.ts` 新增的
+   `locatorOf(target)` 把解析结果转成 Runtime 定位参数——**读与写共用同一套定位判据**。
+2. **整理分两种模式，且必须显式指定**（`src/consolidation/run.ts` 新增 `mode`，默认
+   `full` → DSH 宿主行为不变）。`partial` = 局部合并：跳过全库归档、只动候选集合内部、
+   无向量时按**完整正文**去重（原「前 60 字相同」不足以保证语义相同）。
+   WebAPI 缺 `candidates` 且无 `full` → **400**（不静默触发全库整理）。
+3. **局部合并的候选校验**：上限 50 条，逐条确认属于目标库（跨库 id → 404，不代劳）。
+   同库并发整理 → **409**（进程内执行标记 + `try/finally` 释放）。
+4. **导出路径隔离**：`<dbDir>/palaces/<scope>/<项目库标识>/<导出批次 id>`，
+   export id 由服务端生成（`newExportId`，时间戳 + 随机段），不接受请求传入的路径。
+   目录 0o700 / 文件 0o600；镜像目录在数据目录下、不在 `ui/dist` 内 → 静态路由天然不可达。
+5. 500 错误泄露修正与「未认证写 401 无副作用」在 D2.2 已落地（本次复核未再发现泄露点）。
+
+**顺带修复的三个既有缺陷**（`src/consolidation/run.ts`，均有回归测试）：
+
+| 问题 | 修复 |
+|---|---|
+| 传 `mergeCandidateIds` 时归档阶段仍扫全库 | `partial` 模式整段跳过阶段 1；`full` 保持原行为 |
+| 向量模式只给种子算向量 → 非种子永远无法参与比较 | 按桶内全量计算向量；`full` 限定模式仍只以种子为锚点 |
+| 无向量分支写入失败也 `merged += 1` | 计数移到提交成功之后（失败只计 `skipped`） |
+
+**实施记录**：
+
+- 新增 `codex/web/exports.ts`（导出路径/权限/响应装配）；`api.ts` 路由表 `pending → d23`；
+  `runtime.ts`（`projectDbName` 定位）、`projects.ts`（`locatorOf`）、`consolidation/run.ts`
+  （`mode` + 三处修复）均为**增量修改**，未改 Schema、未改 `projects.resolve` 契约、
+  `server.ts` 零改动。
+- 面板仅一处最小修复：`runBatch` 按 `allSettled` 的实际结果反馈
+  （新增 `batchDone` / `batchPartialFailed` 两个 i18n 键），**不重绘视觉结构**。
+- 测试：`tests/codex-web-api.spec.ts` 34 → **43 断言**（新增 9 个：取代链与脱敏、
+  写操作定位边界、墓志铭、SM-2 + 重启可读、整理模式校验、局部不归档、并发 409、
+  导出解析、镜像隔离）；`tests/consolidation.spec.ts` 3 → **7**（新增局部合并两条、
+  计数修复、完整正文去重）。
+- `smoke-web.mjs` ⑦ 的 501 探测改用 `models`（export 已落地），新增 **⑦c D2.3 写操作
+  与导出**（真实子进程 + 构建产物）：update → review-answer → forget（含墓志铭半填
+  拒绝）→ restore → consolidate 模式校验 → shared/未知项目 → export md/json → mirror
+  落盘与「不改写 SQLite」。
+
+**实测结果（2026-10-15）**：
+
+- `tsc --noEmit`：总数 **109 = D2.2 基线**；`codex/` 与 `src/consolidation` 零错误
+  （既有失败均为未 link-peers 的 `@deepseek-ai/*` 环境问题）。
+- vitest：`tests/codex-web-api.spec.ts` **43/43**；codex 六件套合计 **100/100**
+  （D2.2 为 91）；`tests/consolidation.spec.ts` **7/7**。
+- `pnpm bundle:codex` → `dist/web.js` 84.56 kB（D2.2 为 58.34 kB）。
+- `node codex/scripts/smoke-web.mjs`（真实子进程 + 构建产物）**全部通过**。
 
 ### D2.4 — 真实环境集成与回归（待实施）
 

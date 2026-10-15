@@ -2594,7 +2594,11 @@ export function EngramSection({ t: hostT, workspaces, sessions }: EngramSectionP
     })
   }
 
-  /** 批量执行：逐条调单条 API（回环毫秒级），单条失败不阻塞其余；完成即刷新并清空选择。 */
+  /**
+   * 批量执行：逐条调单条 API（回环毫秒级），单条失败不阻塞其余。
+   * 结算按**实际成功条数**反馈——部分失败要报出失败数量与首个原因，
+   * 不能因为「刷新后剩下的看不见了」就把部分失败显示成全部成功。
+   */
   const runBatch = (mode: 'forget' | 'restore'): void => {
     const targets = mode === 'forget'
       ? selectedRecords.filter(record => record.status === 'active')
@@ -2604,7 +2608,18 @@ export function EngramSection({ t: hostT, workspaces, sessions }: EngramSectionP
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ id: target.id, scope: target.scope }),
-    }))).then(() => { clearSelection(); reload() })
+    }))).then((results) => {
+      const failed = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      if (failed.length === 0) {
+        toast.push('success', t('batchDone', { n: targets.length }))
+      } else {
+        const reason = failed[0]!.reason
+        const msg = reason instanceof Error ? reason.message : String(reason)
+        toast.push('error', t('batchPartialFailed', { n: failed.length, total: targets.length, msg }))
+      }
+      clearSelection()
+      reload()
+    })
   }
 
   const armBatchForget = (): void => {
