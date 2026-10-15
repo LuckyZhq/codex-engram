@@ -32,7 +32,24 @@ export interface ConsolidateOptions {
    * candidate 之外的同 kind 同相似条目也会被并入（避免漏并）。
    */
   readonly mergeCandidateIds?: readonly string[]
+  /**
+   * 执行模式；未传 = `full`（向后兼容）。
+   * `partial` = 局部合并：跳过闭馆归档，且只合并候选集合内部的条目（见 `ConsolidateMode`）。
+   */
+  readonly mode?: ConsolidateMode
 }
+
+/**
+ * 执行模式（Codex WebAPI 显式选择；**默认 `full`，保持 DSH 宿主行为不变**）。
+ *
+ * - `full`：全库整理——阶段 1 闭馆归档 + 阶段 2 合并（向后兼容的默认行为）。
+ *   传了 `mergeCandidateIds` 时，候选只作「合并种子」：非候选条目与种子相似也会被并入
+ *   （原项目有意行为，避免漏并）；归档阶段仍扫全库。
+ * - `partial`：**局部合并**——只针对调用方明确提交的候选集合：跳过全库归档、不把候选
+ *   之外的条目卷进合并，无向量时用完整正文去重（前 60 字相同不足以保证语义相同）。
+ *   用于管理面板「确认合并这 n 条」的场景——用户确认的范围就是实际影响的范围。
+ */
+export type ConsolidateMode = 'full' | 'partial'
 
 /** 单次整理结果摘要（写入 op_log 并返回给调用方）。 */
 export interface ConsolidateReport {
@@ -42,8 +59,8 @@ export interface ConsolidateReport {
   readonly tookMs: number
 }
 
-/** 默认参数。 */
-const DEFAULTS: Required<Omit<ConsolidateOptions, 'scope' | 'mergeCandidateIds'>> = {
+/** 默认参数（`mode` 无默认值：缺省即 `full`，由读取处的 `=== 'partial'` 判定，不进 DEFAULTS）。 */
+const DEFAULTS: Required<Omit<ConsolidateOptions, 'scope' | 'mergeCandidateIds' | 'mode'>> = {
   olderThanDays: 30,
   importanceBelow: 0.3,
   mergeThreshold: 0.92,
@@ -58,6 +75,7 @@ export async function runConsolidation(
   const start = Date.now()
   const options = { ...DEFAULTS, ...opts }
   const scope: 'user' | 'project' | 'shared' = options.scope ?? 'user'
+  const partial = options.mode === 'partial'
   const stats = await store.stats()
   const records = await store.topActive(scope, Math.max(stats.active, 0))
   const archivedIds = new Set<string>()
@@ -68,65 +86,72 @@ export async function runConsolidation(
   const ageCutoff = options.olderThanDays * 86_400_000
 
   // 阶段 1：闭馆归档（清楼）。
-  for (const record of records) {
-    if (record.importance >= options.importanceBelow) continue
-    // lastAccessedAt 通过 store 接口无显式字段；用 createdAt + confidence 衰减作为代理：
-    // 创建已过 ageCutoff 且 confidence < 0.3（低访问代理）则归档。
-    if (now - record.createdAt < ageCutoff) continue
-    if (record.confidence >= 0.3) continue
-    try {
-      await store.forget(record.id)
-      archivedIds.add(record.id)
-      archived += 1
-    } catch {
-      skipped += 1
+  // 局部合并模式**整段跳过**——面板确认的是「合并这 n 条」，不该顺带归档落选条目。
+  if (!partial) {
+    for (const record of records) {
+      if (record.importance >= options.importanceBelow) continue
+      // lastAccessedAt 通过 store 接口无显式字段；用 createdAt + confidence 衰减作为代理：
+      // 创建已过 ageCutoff 且 confidence < 0.3（低访问代理）则归档。
+      if (now - record.createdAt < ageCutoff) continue
+      if (record.confidence >= 0.3) continue
+      try {
+        await store.forget(record.id)
+        archivedIds.add(record.id)
+        archived += 1
+      } catch {
+        skipped += 1
+      }
     }
   }
 
   // 阶段 2：合并相似条目（按 kind 分桶，桶内两两比对）。
-  // 可选 mergeCandidateIds：仅把指定 id 当作「种子」参与比对（同桶内仍允许并入未指定条目）。
   const emb = await embedder
+  const seedIds = options.mergeCandidateIds !== undefined
+    ? new Set(options.mergeCandidateIds)
+    : null
+  // 工作集：局部模式只取候选（不把候选之外的条目卷进来）；全库模式取全部未归档 active。
+  const working = records.filter(record =>
+    !archivedIds.has(record.id) && (!partial || seedIds === null || seedIds.has(record.id)))
   const buckets = new Map<string, MemoryRecord[]>()
-  for (const record of records) {
-    if (archivedIds.has(record.id)) continue
+  for (const record of working) {
     const list = buckets.get(record.kind) ?? []
     list.push(record)
     buckets.set(record.kind, list)
   }
-  const seedIds = options.mergeCandidateIds !== undefined
-    ? new Set(options.mergeCandidateIds)
-    : null
   for (const list of buckets.values()) {
     if (list.length < 2) continue
-    // 限定模式：桶内若无任何种子 id 则跳过该桶（仅在其他桶找到 seed 的关联条目时才合并）。
-    if (seedIds !== null && !list.some(record => seedIds.has(record.id))) continue
+    // 全库限定模式：桶内若无任何种子 id 则跳过该桶（仅在其他桶找到 seed 的关联条目时才合并）。
+    if (!partial && seedIds !== null && !list.some(record => seedIds.has(record.id))) continue
     if (emb === undefined) {
-      // 嵌入不可用：仅按 content 文本前 60 字完全相同做去重启发式（保留 importance 高的 = existing 胜出）。
-      // 当前 record importance 更高时 supersede existing；否则跳过（existing 保持）。
+      // 嵌入不可用：按正文做去重启发式（保留 importance 高的 = existing 胜出）。
+      // 局部合并用**完整正文**相等：前 60 字相同不足以保证两条记忆语义相同，宁可漏并不误并。
       const seen = new Map<string, MemoryRecord>()
       for (const record of list) {
-        const key = record.content.slice(0, 60)
+        const key = partial ? record.content : record.content.slice(0, 60)
         const existing = seen.get(key)
         if (existing === undefined) {
           seen.set(key, record)
         } else if (record.importance > existing.importance) {
-          await store.supersedeMany(
-            { scope, kind: record.kind, content: record.content, importance: record.importance, confidence: record.confidence },
-            [existing.id],
-          ).catch(() => { skipped += 1 })
-          merged += 1
-          seen.set(key, record)
+          // 计数只在提交成功后增加：写入失败时 merged 与「实际归档条数」必须一致。
+          try {
+            await store.supersedeMany(
+              { scope, kind: record.kind, content: record.content, importance: record.importance, confidence: record.confidence },
+              [existing.id],
+            )
+            merged += 1
+            seen.set(key, record)
+          } catch {
+            skipped += 1
+          }
         }
         // existing 已胜：不动。
       }
       continue
     }
-    // 嵌入可用：两两 cosine ≥ 阈值则合并（保留高 importance）。
-    // 限定模式：以种子为起点向外扫；非种子桶内记录只有与某个种子相似才参与合并。
+    // 嵌入可用：两两 cosine ≥ 阈值则合并（保留锚点内容）。
+    // 向量按桶内全部记录计算——限定模式下非种子也要有向量，否则它永远无法与种子比较。
     const vectors = new Map<string, Float32Array>()
     for (const record of list) {
-      // 限定模式下只为种子 id 算向量（节省嵌入开销）。
-      if (seedIds !== null && !seedIds.has(record.id)) continue
       try {
         const vec = (await emb.embed([record.content]))[0]
         if (vec !== undefined) vectors.set(record.id, vec)
@@ -139,14 +164,13 @@ export async function runConsolidation(
     for (let i = 0; i < arr.length; i += 1) {
       const a = arr[i]!
       if (visited.has(a.id)) continue
+      // 全库限定模式：只以种子为锚点向外扫（非种子不主动发起合并，但可被种子并入）。
+      if (!partial && seedIds !== null && !seedIds.has(a.id)) continue
       const dupes: MemoryRecord[] = []
-      for (let j = i + 1; j < list.length; j += 1) {
-        const b = list[j]!
+      for (let j = i + 1; j < arr.length; j += 1) {
+        const b = arr[j]!
         if (visited.has(b.id)) continue
-        // 限定模式：b 必须与某个种子 a 相似才能被并入。
-        const bVec = vectors.get(b.id)
-        if (bVec === undefined) continue
-        const sim = cosine(vectors.get(a.id)!, bVec)
+        const sim = cosine(vectors.get(a.id)!, vectors.get(b.id)!)
         if (sim >= options.mergeThreshold) dupes.push(b)
       }
       if (dupes.length === 0) continue
